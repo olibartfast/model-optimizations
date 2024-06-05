@@ -1,1 +1,3 @@
-# dlai_quantization_in_depth_playground
+# DLAI quantization in depth playground
+
+https://www.deeplearning.ai/short-courses/quantization-in-depth/
