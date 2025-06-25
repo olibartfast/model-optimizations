@@ -1,6 +1,6 @@
 #!/bin/bash
 # Quantization Environment Setup Script
-# Run from the quantization_playground root directory
+# Run from the model-optimizations root directory
 
 # Get the script directory and project root
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,13 +9,13 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
 # Create virtual environment if it doesn't exist
-if [ ! -d "quantization_venv" ]; then
+if [ ! -d "venv" ]; then
     echo "Creating Python virtual environment..."
-    python3.12 -m venv quantization_venv
+    python3.12 -m venv venv
 fi
 
 # Activate virtual environment
-source quantization_venv/bin/activate
+source venv/bin/activate
 
 # Install basic packages first
 echo "Installing basic packages..."
@@ -26,4 +26,4 @@ echo "Installing NVIDIA ModelOpt..."
 pip install --no-build-isolation --extra-index-url https://pypi.ngc.nvidia.com nvidia-modelopt
 
 echo "✅ Environment setup complete!"
-echo "Activate with: source quantization_venv/bin/activate"
+echo "Activate with: source venv/bin/activate"
