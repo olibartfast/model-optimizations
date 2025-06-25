@@ -1,0 +1,9 @@
+wheel
+
+# Install the core libraries
+ultralytics
+onnx
+
+# Install the NVIDIA model optimizer directly (nvidia-pyindex has build issues)
+# Use: pip install --no-build-isolation --extra-index-url https://pypi.ngc.nvidia.com nvidia-modelopt
+nvidia-modelopt
