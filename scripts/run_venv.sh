@@ -1,5 +1,5 @@
 #!/bin/bash
-# Quantization Environment Setup Script
+# Python Virtual Environment Setup Script
 # Run from the model-optimizations root directory
 
 # Get the script directory and project root
