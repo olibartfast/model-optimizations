@@ -3,6 +3,9 @@ wheel
 # Install the core libraries
 ultralytics
 onnx
+onnxruntime-gpu  # falls back to CPU if no CUDA; required by modelopt.onnx calibration
+opencv-python
+pycocotools
 
 # Install the NVIDIA model optimizer directly (nvidia-pyindex has build issues)
 # Use: pip install --no-build-isolation --extra-index-url https://pypi.ngc.nvidia.com nvidia-modelopt
