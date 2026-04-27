@@ -53,7 +53,7 @@ COCO_ROOT = PROJECT_ROOT / "datasets" / "coco"
 VAL_DIR = COCO_ROOT / "val2017"
 OUT_ROOT = PROJECT_ROOT / "runs" / "modelopt_qat"
 
-DEFAULT_MODELS = ("yolo11x", "yolo26x")
+DEFAULT_MODELS = ("yolo11x",)
 
 
 # ---------------------------------------------------------------------------

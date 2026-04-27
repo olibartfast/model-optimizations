@@ -40,3 +40,8 @@ See the documentation in the `docs/` directory for detailed instructions on:
 ## Usage
 
 Navigate to the `yolo_quantization/` directory and explore the `ptq/` and `qat/` subdirectories for specific quantization implementations.
+
+Example usage of the NVIDIA ModelOpt QAT script (runs on yolo11x by default):
+```bash
+python examples/nvidia_modelopt_yolo_qat.py
+```
