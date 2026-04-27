@@ -21,7 +21,7 @@ adapted for object detection:
 Usage
 -----
     python examples/nvidia_modelopt_yolo_qat.py \
-        --models yolo11x yolo26x \
+        [--models yolo11x] \
         --qat-epochs 2 \
         --calib-size 512 \
         --imgsz 640 \
