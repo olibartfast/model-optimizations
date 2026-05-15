@@ -47,19 +47,36 @@ def test_teacher_student_raw_outputs_raises_for_unsupported_type():
         module._teacher_student_raw_outputs({"unexpected": "mapping"})
 
 
-def test_mse_distill_loss_matches_expected_manual_sum():
+def test_mse_distill_loss_per_tensor_normalized_mean():
     module = _load_qat_module()
     student = [torch.zeros(2, 2, requires_grad=True), torch.ones(2, 2, requires_grad=True)]
     teacher = [torch.ones(2, 2, requires_grad=True), torch.zeros(2, 2, requires_grad=True)]
 
     got = module._mse_distill_loss(student, teacher)
-    expected = torch.nn.functional.mse_loss(student[0], teacher[0]) + torch.nn.functional.mse_loss(
-        student[1], teacher[1]
-    )
+    per_tensor = []
+    for s, t in zip(student, teacher):
+        t_det = t.detach()
+        denom = t_det.abs().mean().clamp(min=1e-6)
+        per_tensor.append(torch.nn.functional.mse_loss(s, t_det) / denom)
+    expected = sum(per_tensor) / len(per_tensor)
     assert torch.isclose(got, expected)
     got.backward()
     assert all(t.grad is None for t in teacher)
     assert all(s.grad is not None for s in student)
+
+
+def test_coalign_distill_prefers_one2one_when_student_one2many_empty():
+    module = _load_qat_module()
+    t_one2many = [torch.randn(1, 4, 8)]
+    t_one2one = [torch.randn(1, 4, 8)]
+    s_one2one = [torch.randn(1, 4, 8)]
+    teacher = {"one2many": t_one2many, "one2one": t_one2one}
+    student = {"one2many": {}, "one2one": s_one2one}
+
+    s_aligned, t_aligned = module._coalign_distill_outputs(student, teacher)
+    assert len(s_aligned) == 1 and len(t_aligned) == 1
+    assert t_aligned[0] is t_one2one[0]
+    assert s_aligned[0] is s_one2one[0]
 
 
 def test_mse_distill_loss_raises_when_output_lengths_differ():
