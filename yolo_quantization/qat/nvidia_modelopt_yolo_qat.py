@@ -549,7 +549,12 @@ def _get_modelopt_onnx_bytes(
 
 
 def _teacher_student_raw_outputs(outputs) -> list[torch.Tensor]:
-    """Normalize YOLO detect outputs to raw multi-scale tensors for distillation."""
+    """Normalize YOLO detect outputs to raw multi-scale tensors for distillation.
+
+    Used as a single-input helper for the legacy/back-compat path. The distillation
+    loss path uses :func:`_coalign_distill_outputs` instead so that teacher and student
+    are forced to the same YOLO26 head (``one2one`` vs ``one2many``).
+    """
     if isinstance(outputs, dict):
         if "one2many" in outputs:
             tensors = _teacher_student_raw_outputs(outputs["one2many"])
@@ -579,17 +584,61 @@ def _teacher_student_raw_outputs(outputs) -> list[torch.Tensor]:
     raise TypeError(f"Unsupported YOLO output type for distillation: {type(outputs)!r}")
 
 
+def _extract_yolo_branch_tensors(outputs, branch: str) -> list[torch.Tensor]:
+    """Pull tensors from a specific YOLO26 head (``one2one`` or ``one2many``).
+
+    Returns an empty list if the branch is absent or empty (the quantized student
+    can present an empty ``one2many`` dict).
+    """
+    if not isinstance(outputs, dict) or branch not in outputs:
+        return []
+    branch_out = outputs[branch]
+    if isinstance(branch_out, dict) and not branch_out:
+        return []
+    return _teacher_student_raw_outputs(branch_out)
+
+
+def _coalign_distill_outputs(
+    student_outputs, teacher_outputs
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Co-align teacher and student to the same YOLO26 head.
+
+    ``one2one`` is preferred because both the FP32 teacher and the quantized student
+    populate it; the quantized student's ``one2many`` is empty, which previously caused
+    a silent branch mismatch (teacher one2many vs student one2one) that flowed through
+    MSE and degraded mAP.
+    """
+    for branch in ("one2one", "one2many"):
+        s = _extract_yolo_branch_tensors(student_outputs, branch)
+        t = _extract_yolo_branch_tensors(teacher_outputs, branch)
+        if s and t and len(s) == len(t) and all(si.shape == ti.shape for si, ti in zip(s, t)):
+            return s, t
+    s_fallback = _teacher_student_raw_outputs(student_outputs)
+    t_fallback = _teacher_student_raw_outputs(teacher_outputs)
+    return s_fallback, t_fallback
+
+
 def _mse_distill_loss(student_outputs, teacher_outputs) -> torch.Tensor:
-    student_raw = _teacher_student_raw_outputs(student_outputs)
-    teacher_raw = _teacher_student_raw_outputs(teacher_outputs)
+    """Per-tensor-normalized MSE so feature maps don't dominate boxes/scores.
+
+    The previous implementation summed un-normalized ``mse_loss`` across tensors;
+    ``feats`` maps have ~10^5 elements while ``boxes``/``scores`` are ~10^4-10^5
+    but with very different magnitudes, so feature reconstruction dominated and the
+    decoded prediction signal was effectively ignored.
+    """
+    student_raw, teacher_raw = _coalign_distill_outputs(student_outputs, teacher_outputs)
     if len(student_raw) != len(teacher_raw):
         raise RuntimeError(
             f"Teacher/student raw output count mismatch: {len(student_raw)} vs {len(teacher_raw)}"
         )
-    return sum(
-        torch.nn.functional.mse_loss(s.clone(), t.detach().clone())
-        for s, t in zip(student_raw, teacher_raw)
-    )
+    if not student_raw:
+        raise RuntimeError("Distillation got empty output lists from both teacher and student")
+    losses = []
+    for s, t in zip(student_raw, teacher_raw):
+        t_detached = t.detach()
+        denom = t_detached.abs().mean().clamp(min=1e-6)
+        losses.append(torch.nn.functional.mse_loss(s, t_detached) / denom)
+    return sum(losses) / len(losses)
 
 
 def _distill_epoch_lr(epoch: int, total_epochs: int, peak_lr: float, low_lr: float) -> float:
@@ -691,6 +740,31 @@ def _build_detection_trainer(
     return DetectionTrainer(overrides=overrides)
 
 
+def _supervised_yolo_loss(student_model, student_outputs, batch_data):
+    """Compute YOLO supervised detection loss; for YOLO26 use the one2one head only.
+
+    The quantized student's ``one2many`` dict is empty after PTQ restore (some
+    Detect-head submodule got bypassed by ModelOpt's module replacement). The
+    default ``E2ELoss`` criterion crashes on the empty branch, so we drive the
+    supervised signal through ``one2one`` exclusively. The teacher MSE term in
+    :func:`_mse_distill_loss` already regularizes the student toward FP32 features
+    across the network, so dropping the ``one2many`` *training* loss is fine.
+    """
+    if getattr(student_model, "criterion", None) is None:
+        student_model.criterion = student_model.init_criterion()
+    crit = student_model.criterion
+    if hasattr(crit, "one2one") and hasattr(crit, "one2many"):
+        try:
+            parsed = crit.one2many.parse_output(student_outputs)
+        except Exception:
+            parsed = student_outputs
+        one2one = parsed.get("one2one") if isinstance(parsed, dict) else None
+        if one2one is None or (isinstance(one2one, dict) and not one2one):
+            return crit(student_outputs, batch_data)
+        return crit.one2one.loss(one2one, batch_data)
+    return crit(student_outputs, batch_data)
+
+
 def run_distillation_qat(
     student_model: torch.nn.Module,
     teacher_weights: str,
@@ -702,8 +776,17 @@ def run_distillation_qat(
     low_lr: float,
     batches_per_epoch: int,
     workers: int,
+    distill_weight: float = 1.0,
+    supervised_weight: float = 1.0,
 ) -> None:
-    """Short QAT loop that matches raw teacher outputs on Ultralytics detection batches."""
+    """QAT loop combining COCO supervised detection loss with teacher-student MSE.
+
+    Distillation alone (MSE on raw outputs) was empirically insufficient to bring
+    the quantized student back to PTQ-level mAP — it converged to a plateau that
+    sits below PTQ. Adding the supervised YOLO detection loss against the COCO
+    labels provides the ground-truth anchor that pulls the student weights toward
+    correctness, while the teacher MSE term regularizes them toward FP32 features.
+    """
     from ultralytics import YOLO
 
     cloned_inference_buffers, cloned_amax_states = _prepare_quantized_model_for_training(student_model)
@@ -736,13 +819,18 @@ def run_distillation_qat(
         raise RuntimeError("QAT student model has no trainable parameters")
     optimizer = torch.optim.Adam(params, lr=peak_lr)
 
+    use_supervised = supervised_weight > 0.0
+    use_distill = distill_weight > 0.0
+
     for epoch in range(epochs):
         student_model.train()
         epoch_lr = _distill_epoch_lr(epoch, epochs, peak_lr, low_lr)
         for group in optimizer.param_groups:
             group["lr"] = epoch_lr
 
-        running_loss = 0.0
+        running_distill = 0.0
+        running_supervised = 0.0
+        seen = 0
         for step, batch_data in enumerate(dataloader):
             if step >= batches_per_epoch:
                 break
@@ -751,18 +839,37 @@ def run_distillation_qat(
 
             optimizer.zero_grad(set_to_none=True)
             with torch.no_grad():
-                teacher_outputs = teacher(imgs)
+                teacher_outputs = teacher(imgs) if use_distill else None
             with torch.autocast(device_type=amp_device, enabled=amp_enabled):
                 student_outputs = student_model(imgs)
-                loss = _mse_distill_loss(student_outputs, teacher_outputs)
+                distill_loss = (
+                    _mse_distill_loss(student_outputs, teacher_outputs)
+                    if use_distill
+                    else imgs.new_zeros(())
+                )
+                if use_supervised:
+                    sup_components, _ = _supervised_yolo_loss(student_model, student_outputs, batch_data)
+                    # v8DetectionLoss.loss returns a per-component vector (box/cls/dfl);
+                    # the trainer normally sums it before backward.
+                    sup_loss = sup_components.sum() if sup_components.dim() > 0 else sup_components
+                else:
+                    sup_loss = imgs.new_zeros(())
+                loss = supervised_weight * sup_loss + distill_weight * distill_loss
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            running_loss += float(loss.detach().cpu())
+            running_distill += float(distill_loss.detach().cpu())
+            running_supervised += float(sup_loss.detach().cpu())
+            seen += 1
 
-        avg_loss = running_loss / max(1, min(len(dataloader), batches_per_epoch))
-        print(f"  [qat/distill] epoch {epoch + 1}/{epochs} lr={epoch_lr:.2e} mse={avg_loss:.6f}")
+        denom = max(1, seen)
+        avg_d = running_distill / denom
+        avg_s = running_supervised / denom
+        print(
+            f"  [qat/distill] epoch {epoch + 1}/{epochs} lr={epoch_lr:.2e} "
+            f"sup={avg_s:.4f} mse={avg_d:.4f} (w_sup={supervised_weight}, w_dist={distill_weight})"
+        )
 
 
 def _iter_module_quantizers(module: torch.nn.Module):
@@ -908,6 +1015,8 @@ def run_qat_for_model(
     qat_mode: str,
     qat_low_lr: float,
     qat_batches_per_epoch: int,
+    qat_distill_weight: float,
+    qat_supervised_weight: float,
     calib_size: int,
     calib_method: str,
     calib_percentile: float,
@@ -1032,6 +1141,8 @@ def run_qat_for_model(
                 low_lr=qat_low_lr,
                 batches_per_epoch=qat_batches_per_epoch,
                 workers=dataloader_workers,
+                distill_weight=qat_distill_weight,
+                supervised_weight=qat_supervised_weight,
             )
         else:
             yolo.train(
@@ -1040,7 +1151,7 @@ def run_qat_for_model(
                 imgsz=imgsz,
                 batch=batch,
                 lr0=qat_lr,
-                lrf=qat_lr,  # constant LR over short QAT fine-tune
+                lrf=1.0,  # constant LR (Ultralytics treats lrf as ratio: final_lr = lr0 * lrf)
                 warmup_epochs=0,
                 optimizer=optimizer,
                 close_mosaic=0,
@@ -1307,6 +1418,18 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=200,
         help="Maximum training batches per QAT epoch for the distillation loop",
     )
+    p.add_argument(
+        "--qat-distill-weight",
+        type=float,
+        default=1.0,
+        help="Weight on teacher-student MSE in distill mode (0 disables it)",
+    )
+    p.add_argument(
+        "--qat-supervised-weight",
+        type=float,
+        default=1.0,
+        help="Weight on COCO supervised detection loss in distill mode (0 disables it)",
+    )
     p.add_argument("--optimizer", default="Adam", help="Ultralytics optimizer for QAT fine-tune")
     p.add_argument("--calib-size", type=int, default=512, help="# val2017 images for PTQ")
     p.add_argument(
@@ -1416,6 +1539,8 @@ def main(argv: list[str] | None = None) -> int:
                     qat_mode=args.qat_mode,
                     qat_low_lr=args.qat_low_lr,
                     qat_batches_per_epoch=args.qat_batches_per_epoch,
+                    qat_distill_weight=args.qat_distill_weight,
+                    qat_supervised_weight=args.qat_supervised_weight,
                     calib_size=args.calib_size,
                     calib_method=args.calib_method,
                     calib_percentile=args.calib_percentile,

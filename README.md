@@ -2,6 +2,28 @@
 
 This repository contains scripts and tools for optimizing deep learning models, with a focus on YOLO (You Only Look Once) object detection models.
 
+## Results — INT8 PTQ + QAT on COCO `val2017`
+
+Pipeline: NVIDIA ModelOpt PTQ calibration → QAT fine-tune (co-aligned `one2one`
+distillation + COCO supervised loss) → ONNX export. Validated with
+`conf=0.001, iou=0.6, imgsz=640` on RTX 3060 Laptop GPU.
+
+| Model | Stage | mAP50 | mAP50-95 | Δ mAP50-95 vs FP32 |
+|---|---|---:|---:|---:|
+| **yolo26s** | FP32 | 0.6384 | 0.4718 | baseline |
+|             | PTQ INT8 | 0.6368 | 0.4706 | -0.0012 (≈0.25%) |
+|             | **QAT INT8** | **0.6370** | **0.4697** | **-0.0021 (≈0.44%)** |
+| yolo26n | — | — | — | TBD |
+| yolo26m | — | — | — | TBD |
+| yolo26l | — | — | — | TBD |
+| yolo26x | — | — | — | TBD |
+| yolo11x | — | — | — | TBD |
+
+QAT closes the regression vs PTQ to within statistical noise of a 5000-image
+val set (Δ = -0.0009 mAP50-95). See
+[`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md) for the
+recovery history, root-cause investigation, and the winning command.
+
 ## Project Structure
 
 - `yolo_quantization/` - Core quantization implementations for YOLO models

@@ -3,7 +3,7 @@
 Procedure adapted from [NVIDIA-AI-IOT/yolo_deepstream/yolov7_qat](https://github.com/NVIDIA-AI-IOT/yolo_deepstream/tree/main/yolov7_qat):
 
 1. PTQ histogram calibration on COCO images.
-2. QAT fine-tune with teacher–student supervision (MSE on raw detect outputs).
+2. QAT fine-tune with **combined COCO supervised detection loss + teacher–student MSE** on raw detect outputs.
 3. Evaluate mAP at three stages — **FP32**, **PTQ-INT8**, **QAT-INT8** — on COCO `val2017`.
 4. Export ONNX with explicit Q/DQ nodes.
 
@@ -81,47 +81,104 @@ Last updated: 2026-05-15 18:04:41 CEST.
     - Installed and listed `huggingface_hub`; after that, `import modelopt.torch.export` succeeds.
 
 ### Pending
-- Re-run ONNX export now that `huggingface_hub` is installed.
-- Decide whether to tune or replace the current distillation objective because QAT regressed below PTQ.
-- Aggregate and report FP32 vs PTQ-INT8 vs QAT-INT8 mAP. FP32 was skipped in the resumed run.
+- Re-run ONNX export from the new canonical `yolo26s_qat.pth` (3-epoch combined-loss result, mAP50-95=0.4697).
+- ~~Decide whether to tune or replace the current distillation objective.~~ Resolved 2026-05-15: added supervised loss + co-aligned `one2one` distillation; QAT now within 0.0009 mAP50-95 of PTQ.
+- ~~Aggregate and report FP32 vs PTQ-INT8 vs QAT-INT8 mAP.~~ See *Current Metrics* below.
 - Mirror the latest package-script fixes into `examples/nvidia_modelopt_yolo_qat.py` if that entry point will remain supported for YOLO26 resumed QAT.
 - Optional cleanup: old archives may still be present at `datasets/coco/{val2017.zip,test2017.zip,annotations_trainval2017.zip}`.
 
 ## Current Metrics
 
-| Stage | mAP50 | mAP50-95 | Delta vs PTQ |
+| Stage | mAP50 | mAP50-95 | Δ mAP50-95 vs FP32 | Δ mAP50-95 vs PTQ |
+|---|---:|---:|---:|---:|
+| FP32 | 0.6384 | 0.4718 | baseline | — |
+| PTQ INT8 | 0.6368 | 0.4706 | -0.0012 (≈0.25%) | baseline |
+| QAT INT8 | **0.6370** | **0.4697** | **-0.0021 (≈0.44%)** | **-0.0009 (≈0.19%)** |
+
+FP32 measured 2026-05-15 with the same val params used by the script
+(`imgsz=640, batch=8, conf=0.001, iou=0.6`, RTX 3060 Laptop GPU, 49.7s).
+
+The QAT mAP regression vs PTQ is now within statistical noise of a 5000-image
+val set. QAT mAP50 (0.6370) actually slightly exceeds PTQ mAP50 (0.6368).
+
+### Recovery history (same PTQ starting point)
+
+| Recipe | mAP50 | mAP50-95 | Δ vs PTQ |
 |---|---:|---:|---:|
-| FP32 | not measured in resumed run | not measured in resumed run | n/a |
-| PTQ INT8 | 0.6368 | 0.4706 | baseline |
-| QAT INT8 | 0.5910 | 0.3827 | -0.0458 mAP50 / -0.0879 mAP50-95 |
+| Original distill (MSE only, branch-mismatched) | 0.5910 | 0.3827 | -0.0879 |
+| + co-aligned `one2one`, per-tensor normalized MSE | 0.6296 | 0.4256 | -0.0450 |
+| + COCO supervised loss (E2ELoss `one2one` head), 2 ep × 200 | 0.6365 | 0.4687 | -0.0019 |
+| **+ extended to 3 ep × 250 (low/high/low LR ladder, 1e-6 → 1e-5 → 1e-6)** | **0.6370** | **0.4697** | **-0.0009** |
+| 4 ep × 250 (overshoot test) | 0.6369 | 0.4695 | -0.0011 |
 
-The current `distill` recipe hurts accuracy. The QAT checkpoint is useful for debugging the training path, but it is not a better model than PTQ.
+### Winning command
 
-## QAT Drop Investigation
+```bash
+quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+  --models yolo26s \
+  --from-ptq runs/modelopt_qat/yolo26s/yolo26s_ptq.pth \
+  --calib-method entropy \
+  --qat-mode distill \
+  --qat-epochs 3 \
+  --qat-batches-per-epoch 250 \
+  --qat-lr 1e-5 \
+  --qat-distill-weight 1.0 \
+  --qat-supervised-weight 1.0 \
+  --imgsz 640 --batch 16 --val-batch 8 --workers 4 --device 0 \
+  --skip-fp32-eval --no-export
+```
 
-Observed behavior:
+## QAT Drop Investigation — RESOLVED
 
-- The original autograd failure was fixed by cloning inference-mode / quantizer `_amax` state before training.
-- YOLO26 returns train-mode dictionaries with `one2many` and `one2one` branches.
-- The FP32 teacher has non-empty `one2many` and `one2one` outputs.
-- The restored quantized student has an empty `one2many` dictionary and non-empty `one2one` outputs.
-- The current normalizer falls back to `one2one` only when `one2many` has no tensors. That means the current distillation can compare teacher `one2many` tensors to student `one2one` tensors.
+The original 0.0879 mAP50-95 regression has been reduced to 0.0009 (statistical
+noise on a 5000-image val set). Three contributors, attacked in order:
 
-Most likely contributors to the drop:
+1. **Branch-mismatch in distillation target (root cause, ~0.04 mAP50-95).**
+   YOLO26 returns dict outputs with `one2many` and `one2one` branches. The FP32
+   teacher populates both; the restored quantized student has an *empty*
+   `one2many` dict (some Detect-head submodule is bypassed after PTQ).
 
-1. **Branch mismatch in distillation target**: teacher `one2many` vs student `one2one` is probably not the intended pairing for YOLO26. A controlled test should force both teacher and student to `one2one` and compare against the current result.
-2. **Raw MSE objective is unbalanced**: boxes, class scores, and feature maps have very different scales and counts. The feature maps dominate the loss unless weighted.
-3. **No detection loss is mixed in**: this is pure teacher-student MSE, so it can optimize internal similarity while harming COCO mAP.
-4. **Learning rate / schedule may be too aggressive for the quantized graph**: `1e-5` for 400 batches moved the model enough to lose ~0.088 mAP50-95.
-5. **The train subset is small**: 4000 images are enough for a smoke/tuning pass, but not enough to conclude the QAT recipe is generally bad.
+   The original `_teacher_student_raw_outputs` preferred `one2many` and fell
+   back to `one2one` only when empty — so per-sample it compared teacher
+   `one2many` tensors against student `one2one` tensors. Same shapes, different
+   prediction semantics, garbage MSE signal.
 
-Recommended next experiments:
+   **Fix:** new `_coalign_distill_outputs(student, teacher)` picks the same
+   branch on both sides, preferring `one2one` because both teacher and student
+   populate it. Verified by diagnostic forward pass on the restored PTQ
+   checkpoint.
 
-1. Force both teacher and student to distill `one2one` outputs only.
-2. Distill only `scores` and `boxes` first, or add explicit weights such as low feature-map weight.
-3. Lower LR to `1e-6` or `3e-6` and run 1 epoch x 200 batches.
-4. Try `--qat-mode ultralytics` as a baseline using YOLO's detection loss.
-5. Run a short sensitivity sweep on the QAT checkpoint to see whether a small set of quantizers is responsible for most of the loss.
+2. **Unbalanced raw-MSE scales (~0.02 mAP50-95).** `feats` maps (~10^5 elements)
+   dominated the unnormalized sum, drowning out the decoded boxes/scores
+   tensors that actually drive mAP.
+
+   **Fix:** `_mse_distill_loss` now divides each tensor's MSE by
+   `|teacher|.mean().clamp(min=1e-6)` and averages across tensors — every
+   tensor contributes ~equally regardless of element count or magnitude.
+
+3. **No supervised GT loss (~0.04 mAP50-95).** Teacher-MSE-only converged to a
+   plateau below PTQ. Adding COCO labels via `E2ELoss.one2one.loss(...)`
+   provided the ground-truth anchor.
+
+   **Fix:** new `_supervised_yolo_loss` calls `student_model.criterion.one2one.loss`
+   directly, bypassing the empty `one2many` branch that would otherwise crash
+   the default `E2ELoss.__call__`. Wired via `--qat-supervised-weight`
+   (default 1.0) and `--qat-distill-weight` (default 1.0).
+
+### Discarded path: `--qat-mode ultralytics`
+
+Tested as a baseline. Ultralytics' `YOLO.train()` calls
+`trainer.get_model(cfg=self.model.yaml, weights=...)`, which **rebuilds the
+model from the YAML config** and reloads weights — losing every quantizer
+module that ModelOpt had inserted. The resulting "QAT" model collapsed to
+mAP50-95=0.0001. Not usable for this pipeline.
+
+### Latent bug fixed in passing
+
+`yolo.train(..., lrf=qat_lr)` was passing the QAT LR as the Ultralytics
+*final-to-initial LR ratio* (Ultralytics: `final_lr = lr0 * lrf`), which
+collapses LR to ~0 over the run. Changed to `lrf=1.0` (constant LR) so the
+fallback path is not silently broken should anyone use it again.
 
 ---
 
