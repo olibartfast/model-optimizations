@@ -1,6 +1,6 @@
 # Model Optimizations
 
-This repository contains scripts and tools for optimizing deep learning models, with a focus on YOLO (You Only Look Once) object detection models.
+This repository contains scripts and tools for optimizing deep learning models, currently with a focus on YOLO object detection models.
 
 ## YOLO26 quantization
 
