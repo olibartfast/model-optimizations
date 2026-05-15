@@ -7,7 +7,7 @@ Workflow
 1. Load an Ultralytics YOLO checkpoint (e.g. ``yolo11x.pt``, ``yolo26x.pt``).
 2. Export the model to FP32 ONNX via Ultralytics.
 3. Build a calibration dataset from the COCO 2017 val split
-   (``datasets/coco/val2017``) using the same preprocessing as Ultralytics.
+   (``datasets/coco/images/val2017``) using the same preprocessing as Ultralytics.
 4. Run NVIDIA ``modelopt.onnx.quantization`` post-training quantization
    (INT8 / FP8 / INT4) with the calibration data.
 5. Validate the quantized ONNX model on COCO val with Ultralytics
@@ -54,8 +54,8 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 COCO_YAML = PROJECT_ROOT / "configs" / "coco.yaml"
 COCO_ROOT = PROJECT_ROOT / "datasets" / "coco"
-VAL_DIR = COCO_ROOT / "val2017"
-TEST_DIR = COCO_ROOT / "test2017"
+VAL_DIR = COCO_ROOT / "images" / "val2017"
+TEST_DIR = COCO_ROOT / "images" / "test2017"
 OUT_ROOT = PROJECT_ROOT / "runs" / "modelopt"
 
 DEFAULT_MODELS = ("yolo11x", "yolo26x")

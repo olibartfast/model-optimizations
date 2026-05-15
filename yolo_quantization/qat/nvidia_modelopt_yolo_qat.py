@@ -6,7 +6,7 @@ Mirrors the structure of ``NVIDIA/Model-Optimizer/examples/cnn_qat/``
 (PTQ calibration -> mtq.quantize -> QAT fine-tune -> mto.save -> export),
 adapted for object detection:
 
-* Calibration uses COCO 2017 ``val2017`` images with Ultralytics' inference
+* Calibration uses COCO 2017 ``images/val2017`` images with Ultralytics' inference
   preprocessing (letterbox + RGB + 0-1 float, NCHW).
 * QAT fine-tuning is delegated to ``YOLO.train(data=coco.yaml, ...)`` because
   YOLO has its own detection loss, augmentation pipeline and trainer; the
@@ -46,6 +46,7 @@ import math
 import random
 import sys
 import time
+import traceback
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -56,7 +57,7 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 COCO_YAML = PROJECT_ROOT / "configs" / "coco.yaml"
 COCO_ROOT = PROJECT_ROOT / "datasets" / "coco"
-VAL_DIR = COCO_ROOT / "val2017"
+VAL_DIR = COCO_ROOT / "images" / "val2017"
 OUT_ROOT = PROJECT_ROOT / "runs" / "modelopt_qat"
 
 DEFAULT_MODELS = ("yolo11x", "yolo26x")
@@ -348,18 +349,27 @@ def patch_residual_add_quantizers(model: torch.nn.Module, quant_cfg: dict) -> in
         patched += 1
         return True
 
+    def _quant_input(x: torch.Tensor) -> torch.Tensor:
+        with torch.inference_mode(False):
+            return x.clone()
+
     def bottleneck_forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.cv2(self.cv1(x))
         if not self.add:
             return y
-        return self.add_lhs_quantizer(x) + self.add_rhs_quantizer(y)
+        return self.add_lhs_quantizer(_quant_input(x)) + self.add_rhs_quantizer(_quant_input(y))
 
     def ghost_bottleneck_forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.add_lhs_quantizer(self.conv(x)) + self.add_rhs_quantizer(self.shortcut(x))
+        y = self.conv(x)
+        shortcut = self.shortcut(x)
+        return self.add_lhs_quantizer(_quant_input(y)) + self.add_rhs_quantizer(_quant_input(shortcut))
 
     def resnet_block_forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.cv3(self.cv2(self.cv1(x)))
-        return torch.nn.functional.relu(self.add_lhs_quantizer(y) + self.add_rhs_quantizer(self.shortcut(x)))
+        shortcut = self.shortcut(x)
+        return torch.nn.functional.relu(
+            self.add_lhs_quantizer(_quant_input(y)) + self.add_rhs_quantizer(_quant_input(shortcut))
+        )
 
     def hg_block_forward(self, x: torch.Tensor) -> torch.Tensor:
         y = [x]
@@ -367,16 +377,17 @@ def patch_residual_add_quantizers(model: torch.nn.Module, quant_cfg: dict) -> in
         y = self.ec(self.sc(torch.cat(y, 1)))
         if not self.add:
             return y
-        return self.add_lhs_quantizer(y) + self.add_rhs_quantizer(x)
+        return self.add_lhs_quantizer(_quant_input(y)) + self.add_rhs_quantizer(_quant_input(x))
 
     def cib_forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.cv1(x)
         if not self.add:
             return y
-        return self.add_lhs_quantizer(x) + self.add_rhs_quantizer(y)
+        return self.add_lhs_quantizer(_quant_input(x)) + self.add_rhs_quantizer(_quant_input(y))
 
     def residual_forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.add_lhs_quantizer(x) + self.add_rhs_quantizer(self.m(x))
+        y = self.m(x)
+        return self.add_lhs_quantizer(_quant_input(x)) + self.add_rhs_quantizer(_quant_input(y))
 
     for module in model.modules():
         if isinstance(module, Bottleneck) and getattr(module, "add", False):
@@ -539,12 +550,30 @@ def _get_modelopt_onnx_bytes(
 
 def _teacher_student_raw_outputs(outputs) -> list[torch.Tensor]:
     """Normalize YOLO detect outputs to raw multi-scale tensors for distillation."""
-    if isinstance(outputs, list):
+    if isinstance(outputs, dict):
+        if "one2many" in outputs:
+            tensors = _teacher_student_raw_outputs(outputs["one2many"])
+            if tensors:
+                return tensors
+        if "one2one" in outputs:
+            tensors = _teacher_student_raw_outputs(outputs["one2one"])
+            if tensors:
+                return tensors
+        tensors: list[torch.Tensor] = []
+        for value in outputs.values():
+            tensors.extend(_teacher_student_raw_outputs(value))
+        return tensors
+    if isinstance(outputs, list) and all(torch.is_tensor(x) for x in outputs):
         return outputs
     if isinstance(outputs, tuple):
         for item in reversed(outputs):
             if isinstance(item, list) and all(torch.is_tensor(x) for x in item):
                 return item
+    if isinstance(outputs, list):
+        tensors = []
+        for item in outputs:
+            tensors.extend(_teacher_student_raw_outputs(item))
+        return tensors
     if torch.is_tensor(outputs):
         return [outputs]
     raise TypeError(f"Unsupported YOLO output type for distillation: {type(outputs)!r}")
@@ -557,7 +586,10 @@ def _mse_distill_loss(student_outputs, teacher_outputs) -> torch.Tensor:
         raise RuntimeError(
             f"Teacher/student raw output count mismatch: {len(student_raw)} vs {len(teacher_raw)}"
         )
-    return sum(torch.nn.functional.mse_loss(s, t) for s, t in zip(student_raw, teacher_raw))
+    return sum(
+        torch.nn.functional.mse_loss(s.clone(), t.detach().clone())
+        for s, t in zip(student_raw, teacher_raw)
+    )
 
 
 def _distill_epoch_lr(epoch: int, total_epochs: int, peak_lr: float, low_lr: float) -> float:
@@ -569,6 +601,61 @@ def _distill_epoch_lr(epoch: int, total_epochs: int, peak_lr: float, low_lr: flo
     if epoch < first_cut or epoch >= last_cut:
         return low_lr
     return peak_lr
+
+
+def _trainable_parameters(model: torch.nn.Module) -> list[torch.nn.Parameter]:
+    for p in model.parameters():
+        p.requires_grad = True
+    return [p for p in model.parameters() if p.requires_grad]
+
+
+def _clone_inference_buffers(model: torch.nn.Module) -> int:
+    cloned = 0
+    for module in model.modules():
+        for name, buffer in list(module._buffers.items()):
+            if buffer is not None and hasattr(buffer, "is_inference") and buffer.is_inference():
+                module._buffers[name] = buffer.clone()
+                cloned += 1
+    return cloned
+
+
+def _clone_quantizer_amax_state(model: torch.nn.Module) -> int:
+    cloned = 0
+    for module in model.modules():
+        amax = module._buffers.get("_amax")
+        if not torch.is_tensor(amax):
+            continue
+        with torch.inference_mode(False):
+            module._buffers["_amax"] = amax.clone()
+        cloned += 1
+    return cloned
+
+
+def _prepare_quantized_model_for_training(model: torch.nn.Module) -> tuple[int, int]:
+    """Clone any inference-mode quantizer state before autograd sees it."""
+    inference_buffers = _clone_inference_buffers(model)
+    amax_states = _clone_quantizer_amax_state(model)
+    return inference_buffers, amax_states
+
+
+def _restore_modelopt_checkpoint(mto, model: torch.nn.Module, path: Path, torch_device: torch.device) -> torch.nn.Module:
+    """Restore a ModelOpt checkpoint, including local residual-add quantizer buffers."""
+    objs = torch.load(path, map_location=str(torch_device), weights_only=False)
+    restored = mto.restore_from_modelopt_state(model, objs["modelopt_state"])
+    state_dict = objs["model_state_dict"]
+    current_keys = set(restored.state_dict().keys())
+    for key, value in state_dict.items():
+        if key in current_keys or not key.endswith("._amax"):
+            continue
+        module_name = key[: -len("._amax")]
+        try:
+            module = restored.get_submodule(module_name)
+        except (AttributeError, ValueError):
+            continue
+        if "_amax" not in module._buffers:
+            module.register_buffer("_amax", value.detach().clone())
+    restored.load_state_dict(state_dict)
+    return restored
 
 
 def _build_detection_trainer(
@@ -619,6 +706,12 @@ def run_distillation_qat(
     """Short QAT loop that matches raw teacher outputs on Ultralytics detection batches."""
     from ultralytics import YOLO
 
+    cloned_inference_buffers, cloned_amax_states = _prepare_quantized_model_for_training(student_model)
+    if cloned_inference_buffers:
+        print(f"  [qat] cloned {cloned_inference_buffers} inference buffer(s) before training")
+    if cloned_amax_states:
+        print(f"  [qat] cloned {cloned_amax_states} quantizer amax state tensor(s) before training")
+
     trainer = _build_detection_trainer(teacher_weights, imgsz, batch, device, workers)
     trainer.model = student_model
     trainer.device = _resolve_device(device)
@@ -627,7 +720,7 @@ def run_distillation_qat(
     dataloader = trainer.get_dataloader(trainer.data["train"], batch_size=batch, rank=-1, mode="train")
 
     teacher = YOLO(teacher_weights).model.to(trainer.device)
-    teacher.eval()
+    teacher.train()
     for p in teacher.parameters():
         p.requires_grad = False
 
@@ -638,7 +731,9 @@ def run_distillation_qat(
         if amp_enabled
         else torch.amp.GradScaler("cpu", enabled=False)
     )
-    params = [p for p in student_model.parameters() if p.requires_grad]
+    params = _trainable_parameters(student_model)
+    if not params:
+        raise RuntimeError("QAT student model has no trainable parameters")
     optimizer = torch.optim.Adam(params, lr=peak_lr)
 
     for epoch in range(epochs):
@@ -652,7 +747,7 @@ def run_distillation_qat(
             if step >= batches_per_epoch:
                 break
             batch_data = trainer.preprocess_batch(batch_data)
-            imgs = batch_data["img"]
+            imgs = batch_data["img"].clone()
 
             optimizer.zero_grad(set_to_none=True)
             with torch.no_grad():
@@ -788,6 +883,12 @@ def perform_ptq_on_yolo(
         print(f"  [ptq] policy-disabled {disabled_detect_outputs} detect-head output quantizer(s)")
 
     ptq_ckpt = model_dir / f"{model_name}_ptq.pth"
+    cloned_inference_buffers = _clone_inference_buffers(yolo.model)
+    if cloned_inference_buffers:
+        print(f"  [ptq] cloned {cloned_inference_buffers} inference buffer(s)")
+    cloned_amax_states = _clone_quantizer_amax_state(yolo.model)
+    if cloned_amax_states:
+        print(f"  [ptq] cloned {cloned_amax_states} quantizer amax state tensor(s)")
     mto.save(yolo.model, str(ptq_ckpt))
     ptq_stage.checkpoint = str(ptq_ckpt)
     print(f"  [ptq] saved {ptq_ckpt}")
@@ -825,6 +926,7 @@ def run_qat_for_model(
     sensitivity: bool,
     sensitivity_stage: str,
     sensitivity_max_layers: int,
+    from_ptq: Path | None = None,
 ) -> ModelResult:
     from ultralytics import YOLO
 
@@ -862,24 +964,39 @@ def run_qat_for_model(
 
     # -------- 3. PTQ calibration (mtq.quantize + calibrate closure) --------
     try:
-        ptq_stage, _patched_adds, _unified_add_scales, _disabled_d = perform_ptq_on_yolo(
-            yolo,
-            model_name,
-            model_dir,
-            mto,
-            mtq,
-            torch_device,
-            calib_size,
-            calib_method,
-            calib_percentile,
-            imgsz,
-            batch,
-            val_batch,
-            device,
-            patch_residual_adds,
-            share_residual_add_scales,
-            disable_detect_output_quant,
-        )
+        if from_ptq is not None:
+            if not from_ptq.is_file():
+                raise FileNotFoundError(f"--from-ptq is not a file: {from_ptq}")
+            if patch_residual_adds:
+                quant_cfg = build_quant_cfg(mtq, calib_method, calib_percentile)
+                patched_adds = patch_residual_add_quantizers(yolo.model, quant_cfg)
+                if patched_adds:
+                    print(f"  [ptq] patched {patched_adds} residual add module(s) before restore")
+            print(f"  [ptq] restoring {from_ptq}")
+            yolo.model = _restore_modelopt_checkpoint(mto, yolo.model, from_ptq, torch_device)
+            ptq_stage = StageResult(stage="ptq", checkpoint=str(from_ptq))
+            map50, mAP, secs = eval_on_coco_val(yolo, imgsz, val_batch, device)
+            ptq_stage.map50, ptq_stage.map, ptq_stage.seconds = map50, mAP, secs
+            print(f"  [val/ptq] mAP50={map50:.4f} mAP50-95={mAP:.4f} ({secs:.1f}s)")
+        else:
+            ptq_stage, _patched_adds, _unified_add_scales, _disabled_d = perform_ptq_on_yolo(
+                yolo,
+                model_name,
+                model_dir,
+                mto,
+                mtq,
+                torch_device,
+                calib_size,
+                calib_method,
+                calib_percentile,
+                imgsz,
+                batch,
+                val_batch,
+                device,
+                patch_residual_adds,
+                share_residual_add_scales,
+                disable_detect_output_quant,
+            )
     except Exception as e:
         ptq_stage = StageResult(stage="ptq", error=str(e))
         print(f"  [ptq] FAILED: {e}")
@@ -945,6 +1062,7 @@ def run_qat_for_model(
     except Exception as e:
         qat_stage.error = str(e)
         print(f"  [qat] FAILED: {e}")
+        traceback.print_exc()
     stages.append(qat_stage)
 
     # -------- 5. ONNX export for deployment --------
@@ -1213,6 +1331,12 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Ultralytics device string (e.g. '0', 'cpu')",
     )
     p.add_argument("--skip-fp32-eval", action="store_true", help="Skip baseline mAP")
+    p.add_argument(
+        "--from-ptq",
+        type=Path,
+        default=None,
+        help="Restore an existing mto.save() PTQ checkpoint and continue with QAT; requires one --models entry",
+    )
     p.add_argument("--no-export", action="store_true", help="Skip final ONNX export")
     p.add_argument(
         "--no-modelopt-export",
@@ -1276,6 +1400,9 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.from_ptq is not None and len(args.models) != 1:
+        print("ERROR: --from-ptq requires exactly one --models entry", file=sys.stderr)
+        return 2
 
     all_results: list[ModelResult] = []
     for model_name in args.models:
@@ -1307,6 +1434,7 @@ def main(argv: list[str] | None = None) -> int:
                     sensitivity=args.sensitivity,
                     sensitivity_stage=args.sensitivity_stage,
                     sensitivity_max_layers=args.sensitivity_max_layers,
+                    from_ptq=args.from_ptq,
                 )
             )
         except Exception as e:

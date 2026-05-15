@@ -1,13 +1,13 @@
 # COCO dataset configuration for YOLO
-# This file defines the dataset structure and classes for COCO validation/testing
+# This file defines the dataset structure and classes for COCO train/validation/testing
 
 # Dataset root directory (relative to project root)
 path: ./datasets/coco
 
 # Train, validation, and test sets
-train: # Not included in this download script
-val: val2017
-test: test2017
+train: images/train2017
+val: images/val2017
+test: images/test2017
 
 # Number of classes
 nc: 80
