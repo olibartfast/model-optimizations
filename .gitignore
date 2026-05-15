@@ -1,2 +1,7 @@
 venv
 datasets/
+quantization_venv/
+__pycache__/
+*.py[cod]
+runs/
+*.pt

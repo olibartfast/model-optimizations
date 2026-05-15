@@ -6,7 +6,7 @@ Mirrors the structure of ``NVIDIA/Model-Optimizer/examples/cnn_qat/``
 (PTQ calibration -> mtq.quantize -> QAT fine-tune -> mto.save -> export),
 adapted for object detection:
 
-* Calibration uses COCO 2017 ``val2017`` images with Ultralytics' inference
+* Calibration uses COCO 2017 ``images/val2017`` images with Ultralytics' inference
   preprocessing (letterbox + RGB + 0-1 float, NCHW).
 * QAT fine-tuning is delegated to ``YOLO.train(data=coco.yaml, ...)`` because
   YOLO has its own detection loss, augmentation pipeline and trainer; the
@@ -40,6 +40,7 @@ import math
 import random
 import sys
 import time
+import traceback
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -50,7 +51,7 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 COCO_YAML = PROJECT_ROOT / "configs" / "coco.yaml"
 COCO_ROOT = PROJECT_ROOT / "datasets" / "coco"
-VAL_DIR = COCO_ROOT / "val2017"
+VAL_DIR = COCO_ROOT / "images" / "val2017"
 OUT_ROOT = PROJECT_ROOT / "runs" / "modelopt_qat"
 
 DEFAULT_MODELS = ("yolo11x",)
@@ -312,18 +313,27 @@ def patch_residual_add_quantizers(model: torch.nn.Module, quant_cfg: dict) -> in
         patched += 1
         return True
 
+    def _quant_input(x: torch.Tensor) -> torch.Tensor:
+        with torch.inference_mode(False):
+            return x.clone()
+
     def bottleneck_forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.cv2(self.cv1(x))
         if not self.add:
             return y
-        return self.add_lhs_quantizer(x) + self.add_rhs_quantizer(y)
+        return self.add_lhs_quantizer(_quant_input(x)) + self.add_rhs_quantizer(_quant_input(y))
 
     def ghost_bottleneck_forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.add_lhs_quantizer(self.conv(x)) + self.add_rhs_quantizer(self.shortcut(x))
+        y = self.conv(x)
+        shortcut = self.shortcut(x)
+        return self.add_lhs_quantizer(_quant_input(y)) + self.add_rhs_quantizer(_quant_input(shortcut))
 
     def resnet_block_forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.cv3(self.cv2(self.cv1(x)))
-        return torch.nn.functional.relu(self.add_lhs_quantizer(y) + self.add_rhs_quantizer(self.shortcut(x)))
+        shortcut = self.shortcut(x)
+        return torch.nn.functional.relu(
+            self.add_lhs_quantizer(_quant_input(y)) + self.add_rhs_quantizer(_quant_input(shortcut))
+        )
 
     def hg_block_forward(self, x: torch.Tensor) -> torch.Tensor:
         y = [x]
@@ -331,16 +341,17 @@ def patch_residual_add_quantizers(model: torch.nn.Module, quant_cfg: dict) -> in
         y = self.ec(self.sc(torch.cat(y, 1)))
         if not self.add:
             return y
-        return self.add_lhs_quantizer(y) + self.add_rhs_quantizer(x)
+        return self.add_lhs_quantizer(_quant_input(y)) + self.add_rhs_quantizer(_quant_input(x))
 
     def cib_forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.cv1(x)
         if not self.add:
             return y
-        return self.add_lhs_quantizer(x) + self.add_rhs_quantizer(y)
+        return self.add_lhs_quantizer(_quant_input(x)) + self.add_rhs_quantizer(_quant_input(y))
 
     def residual_forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.add_lhs_quantizer(x) + self.add_rhs_quantizer(self.m(x))
+        y = self.m(x)
+        return self.add_lhs_quantizer(_quant_input(x)) + self.add_rhs_quantizer(_quant_input(y))
 
     for module in model.modules():
         if isinstance(module, Bottleneck) and getattr(module, "add", False):
@@ -505,7 +516,10 @@ def _mse_distill_loss(student_outputs, teacher_outputs) -> torch.Tensor:
         raise RuntimeError(
             f"Teacher/student raw output count mismatch: {len(student_raw)} vs {len(teacher_raw)}"
         )
-    return sum(torch.nn.functional.mse_loss(s, t) for s, t in zip(student_raw, teacher_raw))
+    return sum(
+        torch.nn.functional.mse_loss(s.clone(), t.detach().clone())
+        for s, t in zip(student_raw, teacher_raw)
+    )
 
 
 def _distill_epoch_lr(epoch: int, total_epochs: int, peak_lr: float, low_lr: float) -> float:
@@ -517,6 +531,41 @@ def _distill_epoch_lr(epoch: int, total_epochs: int, peak_lr: float, low_lr: flo
     if epoch < first_cut or epoch >= last_cut:
         return low_lr
     return peak_lr
+
+
+def _trainable_parameters(model: torch.nn.Module) -> list[torch.nn.Parameter]:
+    for p in model.parameters():
+        p.requires_grad = True
+    return [p for p in model.parameters() if p.requires_grad]
+
+
+def _clone_inference_buffers(model: torch.nn.Module) -> int:
+    cloned = 0
+    for module in model.modules():
+        for name, buffer in list(module._buffers.items()):
+            if buffer is not None and hasattr(buffer, "is_inference") and buffer.is_inference():
+                module._buffers[name] = buffer.clone()
+                cloned += 1
+    return cloned
+
+
+def _clone_quantizer_amax_state(model: torch.nn.Module) -> int:
+    cloned = 0
+    for module in model.modules():
+        amax = module._buffers.get("_amax")
+        if not torch.is_tensor(amax):
+            continue
+        with torch.inference_mode(False):
+            module._buffers["_amax"] = amax.clone()
+        cloned += 1
+    return cloned
+
+
+def _prepare_quantized_model_for_training(model: torch.nn.Module) -> tuple[int, int]:
+    """Clone any inference-mode quantizer state before autograd sees it."""
+    inference_buffers = _clone_inference_buffers(model)
+    amax_states = _clone_quantizer_amax_state(model)
+    return inference_buffers, amax_states
 
 
 def _build_detection_trainer(
@@ -567,6 +616,12 @@ def run_distillation_qat(
     """Short QAT loop that matches raw teacher outputs on Ultralytics detection batches."""
     from ultralytics import YOLO
 
+    cloned_inference_buffers, cloned_amax_states = _prepare_quantized_model_for_training(student_model)
+    if cloned_inference_buffers:
+        print(f"  [qat] cloned {cloned_inference_buffers} inference buffer(s) before training")
+    if cloned_amax_states:
+        print(f"  [qat] cloned {cloned_amax_states} quantizer amax state tensor(s) before training")
+
     trainer = _build_detection_trainer(teacher_weights, imgsz, batch, device, workers)
     trainer.model = student_model
     trainer.device = _resolve_device(device)
@@ -586,7 +641,9 @@ def run_distillation_qat(
         if amp_enabled
         else torch.amp.GradScaler("cpu", enabled=False)
     )
-    params = [p for p in student_model.parameters() if p.requires_grad]
+    params = _trainable_parameters(student_model)
+    if not params:
+        raise RuntimeError("QAT student model has no trainable parameters")
     optimizer = torch.optim.Adam(params, lr=peak_lr)
 
     for epoch in range(epochs):
@@ -600,7 +657,7 @@ def run_distillation_qat(
             if step >= batches_per_epoch:
                 break
             batch_data = trainer.preprocess_batch(batch_data)
-            imgs = batch_data["img"]
+            imgs = batch_data["img"].clone()
 
             optimizer.zero_grad(set_to_none=True)
             with torch.no_grad():
@@ -780,6 +837,12 @@ def run_qat_for_model(
             print(f"  [ptq] disabled {disabled_detect_outputs} detect-head output quantizer(s)")
 
         ptq_ckpt = model_dir / f"{model_name}_ptq.pth"
+        cloned_inference_buffers = _clone_inference_buffers(yolo.model)
+        if cloned_inference_buffers:
+            print(f"  [ptq] cloned {cloned_inference_buffers} inference buffer(s)")
+        cloned_amax_states = _clone_quantizer_amax_state(yolo.model)
+        if cloned_amax_states:
+            print(f"  [ptq] cloned {cloned_amax_states} quantizer amax state tensor(s)")
         mto.save(yolo.model, str(ptq_ckpt))
         ptq_stage.checkpoint = str(ptq_ckpt)
         print(f"  [ptq] saved {ptq_ckpt}")
@@ -852,6 +915,7 @@ def run_qat_for_model(
     except Exception as e:
         qat_stage.error = str(e)
         print(f"  [qat] FAILED: {e}")
+        traceback.print_exc()
     stages.append(qat_stage)
 
     # -------- 5. ONNX export for deployment --------
