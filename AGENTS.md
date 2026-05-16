@@ -174,3 +174,31 @@ flag.
   rather than re-calibrating.
 - Validation uses `conf=0.001 iou=0.6` consistently across stages so mAP is
   comparable.
+
+## Keeping `docs/` and `scripts/` in sync
+
+When you change a pipeline's entry point, CLI flags, dataset layout, default
+recipe, or install procedure, update `docs/` and `scripts/` in the same
+change — do not leave stale guidance behind. Specifically:
+
+- **Entry-point or CLI changes** (anything in `yolo_quantization/qat/` or
+  `yolo_quantization/ptq/`): refresh the top-level `README.md` snippets and
+  `yolo_quantization/qat/README.md`'s "Winning command" / resume blocks. If
+  `scripts/run_modelopt_yolo.sh` invokes the changed script, verify it still
+  points at the canonical path and forwards the new flags correctly.
+- **Install / venv / dependency changes**: update `configs/requirements.txt`
+  *and* `scripts/run_venv.sh` together. The venv name in `scripts/run_venv.sh`
+  must match the venv this repo actually uses (`quantization_venv/`).
+- **Dataset layout changes** (`configs/coco.yaml`, label/image directory
+  shape): update `scripts/download_coco_dataset.sh` if the layout it produces
+  no longer matches, and the layout block at the bottom of
+  `yolo_quantization/qat/README.md`.
+- **Deprecating a doc**: delete it rather than letting it drift. Update the
+  `docs/` listing in `README.md` in the same commit so there are no dangling
+  references. Do **not** add new tutorial-style docs that duplicate
+  information already in `README.md`, `AGENTS.md`, or
+  `yolo_quantization/qat/README.md`.
+- **`examples/` lag is expected**: only mirror canonical changes back to
+  `examples/` if you intend to keep that copy supported (see entry-point
+  duplication section above). Otherwise note the lag rather than partially
+  syncing.
