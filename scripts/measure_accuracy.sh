@@ -12,6 +12,11 @@
 #   ./scripts/measure_accuracy.sh yolo11s
 #   ./scripts/measure_accuracy.sh yolo26s [--engine]
 #
+# Env:
+#   PY=<python>             force a Python executable
+#   QUANTIZATION_VENV=<venv-dir>
+#                           use <venv-dir>/bin/python when PY is unset
+#
 # Without --engine: validates yolo*_fp32.onnx and yolo*_qat.onnx via
 # onnxruntime (CPU/GPU fallback). Validates the *symbolic* INT8 graph: Q/DQ
 # nodes are executed as fake-quant (FP arithmetic with quant/dequant noise),
@@ -44,6 +49,14 @@ done
 OUT_DIR="runs/modelopt_qat/$STEM"
 FP32_ONNX="$OUT_DIR/${STEM}_fp32.onnx"
 QAT_ONNX="$OUT_DIR/${STEM}_qat.onnx"
+PY="${PY:-}"
+if [ -z "$PY" ] && [ -n "${QUANTIZATION_VENV:-}" ]; then
+    PY="$QUANTIZATION_VENV/bin/python"
+fi
+if [ ! -x "$PY" ]; then
+    echo "ERROR: Python executable not found. Set PY=<python> or QUANTIZATION_VENV=<venv-dir>." >&2
+    exit 2
+fi
 
 if [ ! -f "$FP32_ONNX" ] || [ ! -f "$QAT_ONNX" ]; then
     echo "ERROR: expected $FP32_ONNX and $QAT_ONNX" >&2
@@ -66,7 +79,7 @@ PT_FILE="${STEM}.pt"
 ENGINE_FP32="$OUT_DIR/${STEM}_fp32.plan"
 ENGINE_INT8="$OUT_DIR/${STEM}_qat_int8.plan"
 
-quantization_venv/bin/python - <<PY
+"$PY" - <<PY
 import json
 from pathlib import Path
 import sys

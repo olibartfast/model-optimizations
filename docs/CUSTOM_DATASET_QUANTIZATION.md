@@ -3,10 +3,44 @@
 This guide shows how to run the canonical YOLO quantization pipelines on a
 non-COCO Ultralytics detection dataset.
 
-Run commands from the repository root and use the existing Python environment:
+Run commands from the repository root after creating the repo-local Python
+environment.
+
+## Python Environment
+
+`<venv-dir>` is a placeholder for your chosen Python 3.12 virtual environment
+directory. The environment contains PyTorch, Ultralytics, NVIDIA ModelOpt,
+ONNX export dependencies, and the extra packages needed by
+`modelopt.torch.export`.
+
+Create it before running quantization:
 
 ```bash
-quantization_venv/bin/python <script> ...
+python3.12 -m venv <venv-dir>
+source <venv-dir>/bin/activate
+python -m pip install --upgrade pip wheel
+python -m pip install --no-build-isolation \
+  --extra-index-url https://pypi.ngc.nvidia.com \
+  -r configs/requirements.txt
+```
+
+The important details are `--no-build-isolation` and the NVIDIA NGC package
+index required for `nvidia-modelopt[torch]`.
+
+Equivalent convenience wrapper:
+
+```bash
+export QUANTIZATION_VENV=<venv-dir>
+./scripts/run_venv.sh
+source <venv-dir>/bin/activate
+```
+
+After activation, use `python` for repo commands.
+
+Verify the environment before running a long quantization job:
+
+```bash
+python -c 'import torch, ultralytics, modelopt.torch.quantization; print("ok")'
 ```
 
 ## Dataset YAML
@@ -57,7 +91,7 @@ This runs FP32 validation, PTQ calibration, QAT distillation, final validation,
 and ONNX export:
 
 ```bash
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s \
   --data configs/my_dataset.yaml \
   --calib-source train \
@@ -71,7 +105,7 @@ quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
 For a shorter smoke test:
 
 ```bash
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s \
   --data configs/my_dataset.yaml \
   --calib-source train \
@@ -85,7 +119,7 @@ quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
 Resume QAT from a saved PTQ checkpoint:
 
 ```bash
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s \
   --data configs/my_dataset.yaml \
   --from-ptq runs/modelopt_qat/yolo26s/yolo26s_ptq.pth \
@@ -109,7 +143,7 @@ runs/modelopt_qat/<model>/
 Use this path when you only need ONNX PTQ export:
 
 ```bash
-quantization_venv/bin/python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
+python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
   --models yolo11x \
   --data configs/my_dataset.yaml \
   --calib-source train \

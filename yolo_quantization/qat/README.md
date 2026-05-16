@@ -38,7 +38,7 @@ Why 260 and 20,000: the NVIDIA yolov7_qat/cuDLA QAT scripts use batch 10, `num_b
 Completed command:
 
 ```bash
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s \
   --calib-size 260 \
   --calib-method entropy \
@@ -165,6 +165,18 @@ hurts it.
 
 ## Commands
 
+Choose, create, and activate a personal venv directory before running the
+commands below:
+
+```bash
+python3.12 -m venv <venv-dir>
+source <venv-dir>/bin/activate
+python -m pip install --upgrade pip wheel
+python -m pip install --no-build-isolation \
+  --extra-index-url https://pypi.ngc.nvidia.com \
+  -r configs/requirements.txt
+```
+
 Verify the full dataset:
 
 ```bash
@@ -177,7 +189,7 @@ wc -l datasets/coco/train2017.txt datasets/coco/val2017.txt
 Run the full-source metric experiment:
 
 ```bash
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s \
   --calib-size 260 \
   --calib-method entropy \
@@ -195,7 +207,7 @@ quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
 Resume QAT from a saved PTQ checkpoint:
 
 ```bash
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s \
   --from-ptq runs/modelopt_qat/yolo26s/yolo26s_ptq.pth \
   --qat-mode distill \
@@ -235,7 +247,7 @@ Selective dequantization (disable quantizers on modules surfaced by the
 sensitivity sweep):
 
 ```bash
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s --from-ptq runs/modelopt_qat/yolo26s/yolo26s_ptq.pth \
   --keep-fp32-modules model.16.m.0.m.0 model.19.m.0.m.0 \
   --skip-fp32-eval --no-export
@@ -245,14 +257,14 @@ Calibrate on a held-out `train2017` slice to avoid the val/eval leak called
 out in caveat #1:
 
 ```bash
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s --calib-source train2017 --calib-size 260
 ```
 
 Run against a custom Ultralytics detection dataset:
 
 ```bash
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s \
   --data configs/my_dataset.yaml \
   --calib-source train \
@@ -286,7 +298,7 @@ Benchmark an exported `*_qat.onnx` through TensorRT (`trtexec` must be on PATH):
 Run helper tests:
 
 ```bash
-quantization_venv/bin/python -m pytest tests/ -q
+python -m pytest tests/ -q
 ```
 
 ---

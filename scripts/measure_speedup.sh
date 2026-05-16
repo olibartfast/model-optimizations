@@ -16,6 +16,9 @@
 #
 # Env / flags:
 #   TRTEXEC=<path>          force a specific trtexec binary
+#   PY=<python>             force a Python executable
+#   QUANTIZATION_VENV=<venv-dir>
+#                           use <venv-dir>/bin/python when PY is unset
 #   IMGSZ=640 BATCH=1       (defaults)
 #   --iterations N          trtexec --iterations
 #   --warmup N              trtexec --warmUp (ms)
@@ -36,6 +39,14 @@ shift
 
 IMGSZ="${IMGSZ:-640}"
 BATCH="${BATCH:-1}"
+PY="${PY:-}"
+if [ -z "$PY" ] && [ -n "${QUANTIZATION_VENV:-}" ]; then
+    PY="$QUANTIZATION_VENV/bin/python"
+fi
+if [ ! -x "$PY" ]; then
+    echo "ERROR: Python executable not found. Set PY=<python> or QUANTIZATION_VENV=<venv-dir>." >&2
+    exit 2
+fi
 ITERATIONS=200
 WARMUP=1000
 KEEP_ENGINES=0
@@ -103,7 +114,7 @@ if [ ! -f "$FP32_ONNX" ]; then
         exit 2
     fi
     echo "Exporting FP32 ONNX from $PT_FILE ..."
-    quantization_venv/bin/python - <<PY
+    "$PY" - <<PY
 from pathlib import Path
 from ultralytics import YOLO
 
@@ -188,7 +199,7 @@ bench_one "qat_int8" "$QAT_ONNX"  "--int8 --fp16"
 # ---- Speedup summary ------------------------------------------------------
 echo
 echo "=== Speedup summary ($STEM @ imgsz=$IMGSZ batch=$BATCH) ==="
-quantization_venv/bin/python - <<PY
+"$PY" - <<PY
 import csv
 rows = list(csv.DictReader(open("$OUT_DIR/speedup.csv")))
 data = {r["engine"]: r for r in rows}

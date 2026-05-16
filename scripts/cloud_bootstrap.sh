@@ -3,7 +3,7 @@
 #
 # Idempotent — re-runs are safe:
 #   1. clone the repo (or `git pull` if already cloned),
-#   2. create/refresh the Python 3.12 venv at quantization_venv/ via run_venv.sh,
+#   2. create/refresh your Python 3.12 venv via run_venv.sh,
 #   3. fetch + extract COCO 2017 into datasets/coco/ via download_coco_dataset.sh,
 #   4. verify the import chain that the QAT/PTQ pipeline depends on.
 #
@@ -20,12 +20,16 @@
 #   SKIP_VENV=1     skip running run_venv.sh
 #   SKIP_DATASET=1  skip COCO download (e.g. if already mounted)
 #   SKIP_VERIFY=1   skip the final import sanity check
+#   QUANTIZATION_VENV=<venv-dir>
+#                   venv directory to create/use (required unless SKIP_VENV=1
+#                   and SKIP_VERIFY=1)
 
 set -e
 
 REPO_URL="${REPO_URL:-https://github.com/olibartfast/model-optimizations.git}"
 REPO_DIR="${REPO_DIR:-model-optimizations}"
 BRANCH="${BRANCH:-master}"
+QUANTIZATION_VENV="${QUANTIZATION_VENV:-}"
 
 echo "=== Cloud bootstrap for model-optimizations ==="
 echo "    repo:   $REPO_URL"
@@ -67,7 +71,9 @@ fi
 if [ "${SKIP_VENV:-0}" = "1" ]; then
     echo "[2/4] SKIP_VENV=1, skipping run_venv.sh"
 else
-    echo "[2/4] Bootstrapping quantization_venv/ via scripts/run_venv.sh ..."
+    : "${QUANTIZATION_VENV:?Set QUANTIZATION_VENV=<venv-dir> before bootstrapping the venv.}"
+    export QUANTIZATION_VENV
+    echo "[2/4] Bootstrapping $QUANTIZATION_VENV via scripts/run_venv.sh ..."
     bash scripts/run_venv.sh
 fi
 echo
@@ -88,10 +94,14 @@ if [ "${SKIP_VERIFY:-0}" = "1" ]; then
     echo "[4/4] SKIP_VERIFY=1, skipping import check"
 else
     echo "[4/4] Verifying the QAT/PTQ import chain ..."
-    if [ ! -x "quantization_venv/bin/python" ]; then
-        echo "WARN: quantization_venv/bin/python not found; skipping verify." >&2
+    PY="${PY:-}"
+    if [ -z "$PY" ] && [ -n "${QUANTIZATION_VENV:-}" ]; then
+        PY="$QUANTIZATION_VENV/bin/python"
+    fi
+    if [ ! -x "$PY" ]; then
+        echo "WARN: Python executable not found; set PY=<python> or QUANTIZATION_VENV=<venv-dir>. Skipping verify." >&2
     else
-        quantization_venv/bin/python - <<'PY'
+        "$PY" - <<'PY'
 import sys
 mods = [
     "torch", "numpy", "onnx", "ultralytics",
@@ -120,8 +130,10 @@ cat <<EOF
 
 === Bootstrap complete ===
 Next:
+  source <venv-dir>/bin/activate
+
   # Resume the existing yolo26s baseline (if you copied yolo26s_ptq.pth):
-  quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \\
+  python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \\
     --models yolo26s \\
     --from-ptq runs/modelopt_qat/yolo26s/yolo26s_ptq.pth \\
     --qat-epochs 10 --qat-batches-per-epoch 200 \\
@@ -129,11 +141,11 @@ Next:
     --batch 16 --val-batch 8 --skip-fp32-eval
 
   # Or run a fresh model (e.g. yolo26x on a 24GB+ GPU):
-  quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \\
+  python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \\
     --models yolo26x --qat-epochs 10 --qat-batches-per-epoch 200 \\
     --qat-log-every 20 --qat-eval-every 5 --seed 0 \\
     --batch 16 --val-batch 8 --device 0
 
   # Run helper tests (no GPU required):
-  quantization_venv/bin/python -m pytest tests/ -q
+  python -m pytest tests/ -q
 EOF

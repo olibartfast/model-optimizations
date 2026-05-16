@@ -26,9 +26,17 @@ if [ "${1:-}" = "qat" ] || [ "${1:-}" = "ptq" ]; then
     shift
 fi
 
-if [ -d "venv" ] && [ -z "${VIRTUAL_ENV:-}" ]; then
-    # shellcheck disable=SC1091
-    source venv/bin/activate
+PY="${PY:-}"
+if [ -z "$PY" ] && [ -n "${QUANTIZATION_VENV:-}" ]; then
+    PY="$QUANTIZATION_VENV/bin/python"
+fi
+if [ -z "$PY" ] && [ -n "${VIRTUAL_ENV:-}" ]; then
+    PY="$VIRTUAL_ENV/bin/python"
+fi
+if [ ! -x "$PY" ]; then
+    echo "ERROR: Python executable not found. Set PY=<python> or" \
+         "QUANTIZATION_VENV=<venv-dir>, then run scripts/run_venv.sh." >&2
+    exit 2
 fi
 
 HAS_CUSTOM_DATA=0
@@ -44,7 +52,7 @@ if [ "$HAS_CUSTOM_DATA" -eq 0 ] && [ ! -d "datasets/coco/val2017" ]; then
 fi
 
 case "$MODE" in
-    qat) exec python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py "$@" ;;
-    ptq) exec python yolo_quantization/ptq/nvidia_modelopt_yolo.py "$@" ;;
+    qat) exec "$PY" yolo_quantization/qat/nvidia_modelopt_yolo_qat.py "$@" ;;
+    ptq) exec "$PY" yolo_quantization/ptq/nvidia_modelopt_yolo.py "$@" ;;
     *)   echo "Unknown mode: $MODE (expected qat|ptq)"; exit 2 ;;
 esac

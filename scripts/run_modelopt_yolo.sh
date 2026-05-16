@@ -26,11 +26,13 @@ if [ "${1:-}" = "qat" ] || [ "${1:-}" = "ptq" ]; then
     shift
 fi
 
-# Prefer the pre-built quantization_venv (ModelOpt is installed there).
-PY="quantization_venv/bin/python"
+PY="${PY:-}"
+if [ -z "$PY" ] && [ -n "${QUANTIZATION_VENV:-}" ]; then
+    PY="$QUANTIZATION_VENV/bin/python"
+fi
 if [ ! -x "$PY" ]; then
-    echo "ERROR: $PY not found. Bootstrap a venv with scripts/run_venv.sh or" \
-         "ensure quantization_venv/ exists at the repo root." >&2
+    echo "ERROR: Python executable not found. Set PY=<python> or" \
+         "QUANTIZATION_VENV=<venv-dir>, then run scripts/run_venv.sh." >&2
     exit 2
 fi
 
