@@ -97,6 +97,35 @@ def test_trainable_parameters_unfreezes_student_model():
     assert all(param.requires_grad for param in params)
 
 
+def test_freeze_batch_norm_stats_keeps_affine_trainable():
+    module = _load_qat_module()
+    model = torch.nn.Sequential(torch.nn.Conv2d(1, 2, 1), torch.nn.BatchNorm2d(2))
+    model.train()
+
+    frozen = module._freeze_batch_norm_stats(model)
+
+    assert frozen == 1
+    assert not model[1].training
+    assert model[1].weight.requires_grad
+    assert model[1].bias.requires_grad
+
+
+def test_select_sensitivity_candidates_samples_across_depth():
+    module = _load_qat_module()
+    candidates = [(f"layer{i}", torch.nn.Identity()) for i in range(10)]
+
+    selected = module._select_sensitivity_candidates(candidates, max_layers=4)
+
+    assert [name for name, _ in selected] == ["layer0", "layer3", "layer6", "layer9"]
+
+
+def test_select_sensitivity_candidates_zero_means_all():
+    module = _load_qat_module()
+    candidates = [(f"layer{i}", torch.nn.Identity()) for i in range(3)]
+
+    assert module._select_sensitivity_candidates(candidates, max_layers=0) == candidates
+
+
 def test_clone_inference_buffers_ignores_normal_buffers():
     module = _load_qat_module()
     model = torch.nn.BatchNorm2d(2)
