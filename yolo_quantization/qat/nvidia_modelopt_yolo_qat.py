@@ -22,11 +22,12 @@ Usage
 -----
     python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
         --models yolo11x yolo26x \
-        --qat-epochs 3 \
-        --calib-size 512 \
+        --qat-epochs 10 \
+        --qat-batches-per-epoch 200 \
+        --calib-size 260 \
         --calib-method entropy \
         --imgsz 640 \
-        --batch 16
+        --batch 10
 
     # PTQ-only sensitivity sweep (optionally ``--from-ptq`` to load a prior ``*_ptq.pth``)::
 
@@ -1306,7 +1307,7 @@ def parse_sensitivity_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS), help="Ultralytics checkpoint stem(s) (e.g. yolo11n)")
-    p.add_argument("--calib-size", type=int, default=512, help="# val2017 images for PTQ (unless --from-ptq)")
+    p.add_argument("--calib-size", type=int, default=260, help="# val2017 images for PTQ (unless --from-ptq)")
     p.add_argument(
         "--calib-method",
         choices=("max", "entropy", "percentile", "smoothquant"),
@@ -1315,7 +1316,7 @@ def parse_sensitivity_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--calib-percentile", type=float, default=99.99, help="For --calib-method=percentile")
     p.add_argument("--imgsz", type=int, default=640)
-    p.add_argument("--batch", type=int, default=16)
+    p.add_argument("--batch", type=int, default=10)
     p.add_argument("--val-batch", type=int, default=8)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument(
@@ -1446,7 +1447,7 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS))
-    p.add_argument("--qat-epochs", type=int, default=3, help="QAT fine-tune epochs")
+    p.add_argument("--qat-epochs", type=int, default=10, help="QAT fine-tune epochs")
     p.add_argument("--qat-lr", type=float, default=1e-5, help="Constant LR for QAT fine-tune")
     p.add_argument("--qat-low-lr", type=float, default=1e-6, help="Low LR used on the outer legs of the distillation schedule")
     p.add_argument(
@@ -1458,7 +1459,7 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--qat-batches-per-epoch",
         type=int,
-        default=250,
+        default=200,
         help="Maximum training batches per QAT epoch for the distillation loop",
     )
     p.add_argument(
@@ -1474,7 +1475,7 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Weight on COCO supervised detection loss in distill mode (0 disables it)",
     )
     p.add_argument("--optimizer", default="Adam", help="Ultralytics optimizer for QAT fine-tune")
-    p.add_argument("--calib-size", type=int, default=512, help="# val2017 images for PTQ")
+    p.add_argument("--calib-size", type=int, default=260, help="# val2017 images for PTQ")
     p.add_argument(
         "--calib-method",
         choices=("max", "entropy", "percentile", "smoothquant"),
@@ -1488,7 +1489,7 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Percentile used when --calib-method=percentile",
     )
     p.add_argument("--imgsz", type=int, default=640)
-    p.add_argument("--batch", type=int, default=16, help="Train + calib batch size")
+    p.add_argument("--batch", type=int, default=10, help="Train + calib batch size")
     p.add_argument("--val-batch", type=int, default=8)
     p.add_argument("--workers", type=int, default=4, help="Dataloader workers for custom QAT/distillation")
     p.add_argument(
