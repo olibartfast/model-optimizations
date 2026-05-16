@@ -114,6 +114,13 @@ Avoid `--qat-mode ultralytics`: `YOLO.train()` rebuilds the model from YAML and 
 
 ---
 
+## Future Roadmap
+
+- INT4 QAT exploration: keep the production baseline on INT8 QAT until INT4 has its own smoke-tested path. Start with ModelOpt torch `INT4_AWQ_CFG` or `INT4_BLOCKWISE_WEIGHT_ONLY_CFG` as weight-only INT4 fine-tuning, then consider activation INT4 only after the weight-only path is stable.
+- Required smoke checks before any full COCO run: PTQ/restore succeeds, one-batch backward works, mAP is sane on a small validation slice, and ONNX export/deployability is verified. Do not treat activation+weight INT4 as ready or expected to work until those checks pass.
+
+---
+
 ## Commands
 
 Verify the full dataset:
@@ -160,11 +167,61 @@ quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --no-export
 ```
 
+Add structured training logs and intermediate eval to either command above:
+
+```bash
+  --qat-log-every 20    # heartbeat every 20 batches: [qat/distill] step k/B ...
+  --qat-eval-every 5    # COCO val every 5 epochs; saves yolo*_qat_best.pth on improvement
+  --seed 0              # pin Python/Numpy/Torch RNG for reproducibility
+```
+
+Each run now writes `runs/modelopt_qat/<model>/qat_train.csv` with per-epoch
+`lr, sup, sup_box, sup_cls, sup_dfl, mse, total, secs, amax_count, amax_mean,
+amax_rel_drift, amax_max_rel_drift` (and `map50/map/eval_secs` whenever
+`--qat-eval-every` fires). The same rows land in `summary.json['qat_train']`
+alongside `best_checkpoint`, `best_map`, `best_epoch`, and a `config` block.
+
 Read final metrics:
 
 ```bash
 cat runs/modelopt_qat/yolo26s/summary.json
+cat runs/modelopt_qat/yolo26s/qat_train.csv
 cat runs/modelopt_qat/report.json
+```
+
+Selective dequantization (disable quantizers on modules surfaced by the
+sensitivity sweep):
+
+```bash
+quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+  --models yolo26s --from-ptq runs/modelopt_qat/yolo26s/yolo26s_ptq.pth \
+  --keep-fp32-modules model.16.m.0.m.0 model.19.m.0.m.0 \
+  --skip-fp32-eval --no-export
+```
+
+Calibrate on a held-out `train2017` slice to avoid the val/eval leak called
+out in caveat #1:
+
+```bash
+quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+  --models yolo26s --calib-source train2017 --calib-size 260
+```
+
+Run the runtime experiment matrices (each subrun copies its outputs into
+`runs/modelopt_qat_experiments/<mode>/<tag>/` so the canonical tree is not
+overwritten):
+
+```bash
+./scripts/run_qat_experiments.sh matrix       # yolo26{n,s,m,l,x} + yolo11x
+./scripts/run_qat_experiments.sh ablation     # --disable-detect-output-quant on/off
+./scripts/run_qat_experiments.sh seeds        # multi-seed variance on yolo26s
+DRY_RUN=1 ./scripts/run_qat_experiments.sh seeds   # preview the commands
+```
+
+Benchmark an exported `*_qat.onnx` through TensorRT (`trtexec` must be on PATH):
+
+```bash
+./scripts/bench_trt.sh runs/modelopt_qat/yolo26s/yolo26s_qat.onnx
 ```
 
 Run helper tests:

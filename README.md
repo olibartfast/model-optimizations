@@ -9,6 +9,7 @@ PTQ histogram calibration on COCO images, followed by QAT fine-tuning that
 combines a co-aligned `one2one`-head teacher–student distillation with the
 COCO supervised detection loss. Current full-source experiment log and
 resume commands: [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
+Future INT4 QAT exploration is tracked as roadmap work in the same QAT README.
 
 ### Results — INT8 PTQ + QAT on COCO `val2017`
 

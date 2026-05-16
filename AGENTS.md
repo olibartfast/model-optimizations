@@ -63,8 +63,17 @@ quantization_venv/bin/python -m pytest tests/test_qat_helpers.py::test_distill_e
 ```bash
 quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s --qat-epochs 10 --qat-batches-per-epoch 200 \
-  --calib-size 260 --imgsz 640 --batch 10 --val-batch 8 --device 0
+  --calib-size 260 --imgsz 640 --batch 10 --val-batch 8 --device 0 \
+  --qat-log-every 20 --qat-eval-every 5 --seed 0
 ```
+
+`--qat-log-every N` emits a `[qat/distill] step k/B` heartbeat every N batches.
+`--qat-eval-every N` runs a COCO val pass every N epochs (and on the final one),
+saving `*_qat_best.pth` whenever mAP50-95 improves. `--seed N` pins the RNGs for
+reproducibility. Per-epoch training metrics — `lr, sup, sup_box, sup_cls,
+sup_dfl, mse, secs, amax_rel_drift, map50, map` — are persisted to
+`runs/modelopt_qat/<model>/qat_train.csv` and mirrored under
+`summary.json['qat_train']`.
 
 **Resume QAT from a saved PTQ checkpoint** (skips re-calibration):
 ```bash
@@ -79,6 +88,45 @@ quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
 ```bash
 quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   sensitivity --models yolo26s --from-ptq runs/modelopt_qat/yolo26s/yolo26s_ptq.pth
+```
+
+**Selective dequantization** — disable quantizers on specific modules
+identified by the sensitivity sweep:
+```bash
+quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+  --models yolo26s --from-ptq runs/modelopt_qat/yolo26s/yolo26s_ptq.pth \
+  --keep-fp32-modules model.16.m.0.m.0 model.19.m.0.m.0 --skip-fp32-eval
+```
+
+**Calibration source** — use a held-out train2017 slice instead of val2017 to
+avoid the calibration/eval leak:
+```bash
+quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+  --models yolo26s --calib-source train2017 --calib-size 260
+```
+
+**Experiment driver** (`scripts/run_qat_experiments.sh`) runs the recipe across
+multiple variants and stashes outputs under `runs/modelopt_qat_experiments/`:
+
+```bash
+DRY_RUN=1 ./scripts/run_qat_experiments.sh seeds      # preview the 3-seed plan
+./scripts/run_qat_experiments.sh matrix               # yolo26{n,s,m,l,x} + yolo11x
+./scripts/run_qat_experiments.sh ablation             # --disable-detect-output-quant on/off
+./scripts/run_qat_experiments.sh seeds                # 3-seed variance for yolo26s
+```
+
+**TensorRT runtime benchmark** of an exported `*_qat.onnx`:
+
+```bash
+./scripts/bench_trt.sh runs/modelopt_qat/yolo26s/yolo26s_qat.onnx
+```
+
+**Cloud bootstrap** (Colab / RunPod / AWS) — one-shot clone + venv + COCO:
+
+```bash
+bash scripts/cloud_bootstrap.sh
+# Or remotely without cloning first:
+# bash <(curl -fsSL <repo-raw>/scripts/cloud_bootstrap.sh)
 ```
 
 **Run PTQ-only ONNX pipeline**:
