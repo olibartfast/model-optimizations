@@ -124,22 +124,35 @@ per model family (yolo26* → `yolo26-distill`; everything else →
 | `yolo11-distill` | Single-head (v8/v11/…) | 1e-5 peak / 1e-6 low | distill (1.0) + supervised (1.0) | **max, 1024 imgs** | **disabled** | **disabled** | 10 |
 | `yolo11-supervised` | Single-head, larger PTQ-FP32 gap (rare) | 1e-4 peak / 1e-5 low | supervised-only (1.0) | max, 1024 imgs | disabled | disabled | 5 |
 
-Why the single-head recipe differs:
+Why the single-head recipe differs — what "PTQ layer exclusions" actually means:
 
-- **DFL excluded** — Distribution-Focal-Loss outputs encode the distribution
-  over box-regression bins; INT8 quantization of these probabilities
-  compounds across the decode and is a large mAP regressor for single-head
-  YOLOs. yolo26 uses E2E head architecture where `model.23.dfl` is an
-  `Identity` no-op, so this flag is a no-op there.
-- **Detect-head output quantizers disabled** — same reasoning; the head
-  outputs have a wide dynamic range that INT8 cannot represent without
-  cost.
+- **DFL (Distribution-Focal-Loss) head kept FP** — the DFL head learns a
+  16-bin probability distribution per box coordinate and integrates it back
+  to a continuous regression value. INT8 quantization of those bin
+  probabilities introduces ~1% noise per bin, and the integration amplifies
+  it across the 16 bins, producing wrong box centers and sizes. Excluding
+  the DFL conv keeps box regression accurate while the rest of the network
+  stays INT8. yolo26 uses an E2E head where `model.23.dfl` is an `Identity`
+  no-op, so this flag is a no-op there — `--qat-recipe auto` only enables
+  it for single-head models.
+- **Detect-head output quantizers disabled** — the final Detect head
+  outputs (raw class logits and decoded box tensors) have a much wider
+  dynamic range than mid-network features. Per-tensor INT8 calibration
+  clamps the tails, suppressing both rare-class confidence and large-box
+  coordinates. Disabling these quantizers leaves the head in FP without
+  affecting the preceding backbone/neck INT8.
 - **`max` calibration** — empirically gives a higher PTQ baseline for
   single-head models (yolo11s PTQ: 0.4614 with max vs 0.4603 with entropy).
-- **`yolo11-supervised` was tried first** (UBON-inspired) and *collapsed*
-  yolo11s mAP at lr=1e-4: epoch 2 dropped to mAP50-95=0.3807. Kept as an
-  option for cases where the PTQ-FP32 gap is large enough to justify
-  supervised-only training, but `yolo11-distill` is recommended.
+- **`yolo11-supervised` was tried first** and *collapsed* yolo11s mAP at
+  lr=1e-4: epoch 2 dropped to mAP50-95=0.3807. Kept as an option for cases
+  where the PTQ-FP32 gap is large enough to justify supervised-only
+  training, but `yolo11-distill` is recommended.
+
+The DFL-exclusion technique is documented in the
+[`UBON_QAT.md`](https://github.com/ubonpartners/ultralytics/blob/94046a6b2ee10c00281fd11519c576ebf5b3895e/UBON_QAT.md)
+reference in the ubonpartners/ultralytics fork, but the underlying observation
+is independent of that fork — DFL's bin-probability semantics are why INT8
+hurts it.
 
 ---
 
