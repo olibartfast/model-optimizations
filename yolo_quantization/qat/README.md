@@ -100,7 +100,9 @@ QAT: mAP50=0.6369914336897926, mAP50-95=0.47010458539764405, val=66.1s
 
 ## Implementation Notes
 
-`yolo_quantization/qat/nvidia_modelopt_yolo_qat.py` is the canonical entry point. The `examples/` copy is older and should not be used for resumed YOLO26 QAT unless fixes are mirrored.
+`yolo_quantization/qat/nvidia_modelopt_yolo_qat.py` is the only supported QAT
+entry point. Do not add runnable copies under `examples/`; use thin wrappers
+that delegate here.
 
 Important QAT fixes already in the canonical script:
 
