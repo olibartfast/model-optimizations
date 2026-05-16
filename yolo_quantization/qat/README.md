@@ -14,7 +14,7 @@ Hardware: NVIDIA GeForce RTX 3060 Laptop GPU.
 
 ## Current Baseline
 
-The old 4000-image train-subset experiment is superseded. The active baseline now uses the full COCO `train2017` image pool so the QAT dataloader can sample from the same distribution scale as the NVIDIA examples.
+The active baseline uses the full COCO `train2017` image pool so the QAT dataloader can sample from the same distribution scale as the NVIDIA examples.
 
 | Item | Current value |
 |---|---:|
@@ -83,8 +83,6 @@ PTQ: mAP50=0.6368257036873418, mAP50-95=0.47062866593006675, val=64.5s
 QAT: mAP50=0.6369914336897926, mAP50-95=0.47010458539764405, val=66.1s
 ```
 
-Previous 4k-subset results were intentionally removed from the active table because their train source pool biased the experiment design.
-
 ---
 
 ## Key Design Decisions
@@ -92,7 +90,7 @@ Previous 4k-subset results were intentionally removed from the active table beca
 | Decision | Choice | Reason |
 |---|---|---|
 | Eval set | `val2017` | COCO `test2017` has no public labels, so local mAP is not possible. |
-| QAT training data | Full `train2017` image pool | Removes the prior 4000-image source-pool bias while still using the same 20,000-presentation NVIDIA fine-tune budget. |
+| QAT training data | Full `train2017` image pool | Uses the full source distribution while keeping the same 20,000-presentation NVIDIA fine-tune budget. |
 | Calibration data | `val2017` | Matches the existing script and NVIDIA-style reference shape. PTQ amax estimation is statistics-only, but a train-held-out calibration split would be cleaner for a final benchmark. |
 | Calibration algorithm | `entropy` | yolov7_qat uses Histogram(MSE); ModelOpt CLI choices are `max`, `entropy`, `percentile`, and `smoothquant`, so `entropy` is the closest built-in histogram path. |
 | QAT mode | `distill` | Combines COCO supervised loss with teacher-student MSE, matching the intended NVIDIA supervision pattern while preserving ModelOpt quantizers. |
