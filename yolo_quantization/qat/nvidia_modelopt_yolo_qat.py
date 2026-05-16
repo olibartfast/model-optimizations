@@ -20,16 +20,17 @@ adapted for object detection:
 
 Usage
 -----
-    python examples/nvidia_modelopt_yolo_qat.py \
+    python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
         --models yolo11x yolo26x \
-        --qat-epochs 2 \
+        --qat-epochs 3 \
         --calib-size 512 \
+        --calib-method entropy \
         --imgsz 640 \
         --batch 16
 
     # PTQ-only sensitivity sweep (optionally ``--from-ptq`` to load a prior ``*_ptq.pth``)::
 
-        python examples/nvidia_modelopt_yolo_qat.py sensitivity --models yolo11n
+        python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py sensitivity --models yolo11n
 
 Every stage is resumable: FP32 / PTQ / QAT checkpoints, calibration tensors
 and per-model summaries are cached under ``runs/modelopt_qat/``.
@@ -658,6 +659,16 @@ def _trainable_parameters(model: torch.nn.Module) -> list[torch.nn.Parameter]:
     return [p for p in model.parameters() if p.requires_grad]
 
 
+def _freeze_batch_norm_stats(model: torch.nn.Module) -> int:
+    """Keep BatchNorm running stats fixed while leaving affine params trainable."""
+    frozen = 0
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            module.eval()
+            frozen += 1
+    return frozen
+
+
 def _clone_inference_buffers(model: torch.nn.Module) -> int:
     cloned = 0
     for module in model.modules():
@@ -778,6 +789,8 @@ def run_distillation_qat(
     workers: int,
     distill_weight: float = 1.0,
     supervised_weight: float = 1.0,
+    freeze_teacher_bn: bool = False,
+    freeze_student_bn: bool = False,
 ) -> None:
     """QAT loop combining COCO supervised detection loss with teacher-student MSE.
 
@@ -804,6 +817,11 @@ def run_distillation_qat(
 
     teacher = YOLO(teacher_weights).model.to(trainer.device)
     teacher.train()
+    frozen_teacher_bn = _freeze_batch_norm_stats(teacher) if freeze_teacher_bn else 0
+    if frozen_teacher_bn:
+        print(f"  [qat] froze {frozen_teacher_bn} teacher BatchNorm module(s)")
+    elif freeze_teacher_bn:
+        print("  [qat] requested teacher BatchNorm freeze, but found no BatchNorm modules")
     for p in teacher.parameters():
         p.requires_grad = False
 
@@ -824,6 +842,11 @@ def run_distillation_qat(
 
     for epoch in range(epochs):
         student_model.train()
+        frozen_student_bn = _freeze_batch_norm_stats(student_model) if freeze_student_bn else 0
+        if epoch == 0 and frozen_student_bn:
+            print(f"  [qat] froze {frozen_student_bn} student BatchNorm module(s)")
+        elif epoch == 0 and freeze_student_bn:
+            print("  [qat] requested student BatchNorm freeze, but found no BatchNorm modules")
         epoch_lr = _distill_epoch_lr(epoch, epochs, peak_lr, low_lr)
         for group in optimizer.param_groups:
             group["lr"] = epoch_lr
@@ -885,6 +908,23 @@ def _iter_module_quantizers(module: torch.nn.Module):
             yield quantizer
 
 
+def _select_sensitivity_candidates(
+    candidates: list[tuple[str, torch.nn.Module]], max_layers: int
+) -> list[tuple[str, torch.nn.Module]]:
+    """Limit sensitivity candidates by sampling across model depth instead of truncating early layers."""
+    if max_layers <= 0 or len(candidates) <= max_layers:
+        return candidates
+    if max_layers == 1:
+        return [candidates[-1]]
+
+    last_idx = len(candidates) - 1
+    selected_indices = {
+        round(i * last_idx / (max_layers - 1))
+        for i in range(max_layers)
+    }
+    return [candidate for idx, candidate in enumerate(candidates) if idx in selected_indices]
+
+
 def run_sensitivity_sweep(
     yolo,
     imgsz: int,
@@ -903,8 +943,7 @@ def run_sensitivity_sweep(
         if quantizers:
             candidates.append((name, module))
 
-    if max_layers > 0:
-        candidates = candidates[:max_layers]
+    candidates = _select_sensitivity_candidates(candidates, max_layers)
 
     results: list[dict] = []
     for name, module in candidates:
@@ -1032,6 +1071,8 @@ def run_qat_for_model(
     fuse_before_quant: bool,
     patch_residual_adds: bool,
     share_residual_add_scales: bool,
+    freeze_teacher_bn: bool,
+    freeze_student_bn: bool,
     sensitivity: bool,
     sensitivity_stage: str,
     sensitivity_max_layers: int,
@@ -1143,6 +1184,8 @@ def run_qat_for_model(
                 workers=dataloader_workers,
                 distill_weight=qat_distill_weight,
                 supervised_weight=qat_supervised_weight,
+                freeze_teacher_bn=freeze_teacher_bn,
+                freeze_student_bn=freeze_student_bn,
             )
         else:
             yolo.train(
@@ -1267,7 +1310,7 @@ def parse_sensitivity_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--calib-method",
         choices=("max", "entropy", "percentile", "smoothquant"),
-        default="max",
+        default="entropy",
         help="PTQ path used before the sweep (ignored when --from-ptq is set)",
     )
     p.add_argument("--calib-percentile", type=float, default=99.99, help="For --calib-method=percentile")
@@ -1299,7 +1342,7 @@ def parse_sensitivity_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--sensitivity-max-layers",
         type=int,
         default=24,
-        help="Max quantized parent modules to evaluate (same as the main --sensitivity)",
+        help="Max quantized parent modules to evaluate, sampled across model depth (same as the main --sensitivity)",
     )
     p.add_argument(
         "--from-ptq",
@@ -1403,7 +1446,7 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS))
-    p.add_argument("--qat-epochs", type=int, default=2, help="QAT fine-tune epochs")
+    p.add_argument("--qat-epochs", type=int, default=3, help="QAT fine-tune epochs")
     p.add_argument("--qat-lr", type=float, default=1e-5, help="Constant LR for QAT fine-tune")
     p.add_argument("--qat-low-lr", type=float, default=1e-6, help="Low LR used on the outer legs of the distillation schedule")
     p.add_argument(
@@ -1415,7 +1458,7 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--qat-batches-per-epoch",
         type=int,
-        default=200,
+        default=250,
         help="Maximum training batches per QAT epoch for the distillation loop",
     )
     p.add_argument(
@@ -1435,7 +1478,7 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--calib-method",
         choices=("max", "entropy", "percentile", "smoothquant"),
-        default="max",
+        default="entropy",
         help="Activation calibration method for PTQ/QAT bootstrap",
     )
     p.add_argument(
@@ -1486,6 +1529,16 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Skip forcing patched residual add branches to share the same post-calibration amax",
     )
+    p.add_argument(
+        "--freeze-teacher-bn",
+        action="store_true",
+        help="Keep teacher BatchNorm running stats fixed during distillation while preserving YOLO26 train-mode outputs",
+    )
+    p.add_argument(
+        "--freeze-student-bn",
+        action="store_true",
+        help="Keep student BatchNorm running stats fixed during QAT while still training affine weights",
+    )
     p.add_argument("--sensitivity", action="store_true", help="Run a per-module quantization sensitivity sweep")
     p.add_argument(
         "--sensitivity-stage",
@@ -1497,11 +1550,11 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--sensitivity-max-layers",
         type=int,
         default=24,
-        help="Maximum number of quantized modules to evaluate in the sensitivity sweep",
+        help="Maximum number of quantized modules to evaluate, sampled across model depth",
     )
     p.epilog = (
         "For a dedicated PTQ sensitivity subcommand, run: "
-        "`python examples/nvidia_modelopt_yolo_qat.py sensitivity --help`"
+        "`python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py sensitivity --help`"
     )
     return p.parse_args(argv)
 
@@ -1556,6 +1609,8 @@ def main(argv: list[str] | None = None) -> int:
                     fuse_before_quant=not args.no_fuse_before_quant,
                     patch_residual_adds=not args.no_residual_add_quant,
                     share_residual_add_scales=not args.no_share_residual_add_scales,
+                    freeze_teacher_bn=args.freeze_teacher_bn,
+                    freeze_student_bn=args.freeze_student_bn,
                     sensitivity=args.sensitivity,
                     sensitivity_stage=args.sensitivity_stage,
                     sensitivity_max_layers=args.sensitivity_max_layers,

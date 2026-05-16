@@ -28,8 +28,6 @@ Hardware: NVIDIA GeForce RTX 3060 Laptop GPU.
 
 ## State of the workspace
 
-Last updated: 2026-05-15 18:04:41 CEST.
-
 ### Completed
 1. **Ultralytics upgraded to 8.4.50** in `quantization_venv/` — confirms `yolo26s.pt` (and all `yolo26{n,s,m,l,x}` detect/seg/pose/obb/cls variants) are present in `GITHUB_ASSETS_NAMES`.
 2. **COCO labels + manifests downloaded and extracted** into the Ultralytics layout:
@@ -79,11 +77,12 @@ Last updated: 2026-05-15 18:04:41 CEST.
 10. **Missing export dependencies added to the venv and requirements**:
     - `pulp` was already installed and listed.
     - Installed and listed `huggingface_hub`; after that, `import modelopt.torch.export` succeeds.
+11. **Distillation objective fixed (2026-05-15)**: co-aligned `one2one` distillation + per-tensor-normalized MSE + COCO supervised loss via `E2ELoss.one2one.loss`. QAT now within 0.0009 mAP50-95 of PTQ. See *Current Metrics* and *QAT Drop Investigation — RESOLVED*.
+12. **FP32 / PTQ-INT8 / QAT-INT8 mAP aggregated**: see *Current Metrics* below.
+13. **Package-script defaults aligned with the winning recipe**: `--calib-method entropy`, `--qat-epochs 3`, and `--qat-batches-per-epoch 250` are now defaults. Added opt-in `--freeze-teacher-bn` / `--freeze-student-bn` flags for the next QAT stability experiments, and sensitivity caps now sample across model depth instead of only early modules.
 
 ### Pending
 - Re-run ONNX export from the new canonical `yolo26s_qat.pth` (3-epoch combined-loss result, mAP50-95=0.4697).
-- ~~Decide whether to tune or replace the current distillation objective.~~ Resolved 2026-05-15: added supervised loss + co-aligned `one2one` distillation; QAT now within 0.0009 mAP50-95 of PTQ.
-- ~~Aggregate and report FP32 vs PTQ-INT8 vs QAT-INT8 mAP.~~ See *Current Metrics* below.
 - Mirror the latest package-script fixes into `examples/nvidia_modelopt_yolo_qat.py` if that entry point will remain supported for YOLO26 resumed QAT.
 - Optional cleanup: old archives may still be present at `datasets/coco/{val2017.zip,test2017.zip,annotations_trainval2017.zip}`.
 
@@ -110,6 +109,22 @@ val set. QAT mAP50 (0.6370) actually slightly exceeds PTQ mAP50 (0.6368).
 | + COCO supervised loss (E2ELoss `one2one` head), 2 ep × 200 | 0.6365 | 0.4687 | -0.0019 |
 | **+ extended to 3 ep × 250 (low/high/low LR ladder, 1e-6 → 1e-5 → 1e-6)** | **0.6370** | **0.4697** | **-0.0009** |
 | 4 ep × 250 (overshoot test) | 0.6369 | 0.4695 | -0.0011 |
+
+### Experiment log
+
+All rows below resume from `runs/modelopt_qat/yolo26s/yolo26s_ptq.pth`, skip
+FP32 eval, disable export, and validate on COCO `val2017` with
+`imgsz=640, val_batch=8, conf=0.001, iou=0.6`.
+
+| Variant | Flags | QAT mAP50 | QAT mAP50-95 | Δ mAP50-95 vs PTQ | Outcome |
+|---|---|---:|---:|---:|---|
+| Baseline winning recipe | defaults (`entropy`, 3 ep × 250, no BN freeze) | 0.6370 | 0.4697 | -0.0009 | Current best; reproduced after default update. |
+| Freeze student BN stats | `--freeze-student-bn` | 0.6370 | 0.4697 | -0.0009 | No mAP change; student is already Conv+BN fused before PTQ restore, so the flag has no student BN modules to affect on the resumed checkpoint path. |
+| Freeze teacher BN stats | `--freeze-teacher-bn` | 0.6372 | 0.4697 | -0.0009 | Froze 114 teacher BN modules; mAP50-95 moved by only +0.00003 vs baseline QAT, so not a meaningful gain. |
+| Freeze teacher + student BN stats | `--freeze-teacher-bn --freeze-student-bn` | skipped | skipped | skipped | Not run: student BN freeze is a no-op after Conv+BN fusion, so this collapses to the teacher-BN result. |
+| QAT sensitivity sweep | `--sensitivity --sensitivity-stage qat --sensitivity-max-layers 24` | 0.6373 | 0.4700 | -0.0006 | Covered all 13 quantized parent modules; best single-module dequant was `model.16.m.0.m.0` (`Bottleneck`), +0.00032 mAP50-95 vs baseline QAT. Report is in `runs/modelopt_qat/yolo26s/summary.json`. |
+| Combined top-2 sensitivity dequant | disable quantizers in `model.16.m.0.m.0`, `model.19.m.0.m.0` | 0.6372 | 0.4700 | -0.0006 | Slightly above the best single-module result: 0.47003 mAP50-95. Still below PTQ, so not enough to justify a default policy. |
+| Combined top-3 sensitivity dequant | add `model.6.m.0.m.1` | 0.6373 | 0.4701 | -0.0005 | Best diagnostic result so far: 0.47007 mAP50-95, recovering about 41% of the QAT-vs-PTQ gap but still short of PTQ. |
 
 ### Winning command
 
@@ -227,8 +242,8 @@ quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --from-ptq runs/modelopt_qat/yolo26s/yolo26s_ptq.pth \
   --calib-method entropy \
   --qat-mode distill \
-  --qat-epochs 2 \
-  --qat-batches-per-epoch 200 \
+  --qat-epochs 3 \
+  --qat-batches-per-epoch 250 \
   --imgsz 640 \
   --batch 16 \
   --val-batch 8 \
@@ -267,7 +282,7 @@ Re-run export through the QAT script or add an export-only helper before relying
 | yolov7_qat step | This pipeline equivalent |
 |---|---|
 | `bash scripts/get_coco.sh` | Ultralytics `coco2017labels.zip` + train-subsample fetch (above). |
-| `python scripts/qat.py quantize yolov7.pt --ptq=ptq.pt --qat=qat.pt --eval-ptq --eval-origin` | Single run of `examples/nvidia_modelopt_yolo_qat.py` (does FP32 eval → PTQ calibrate → eval → QAT distill → eval). |
+| `python scripts/qat.py quantize yolov7.pt --ptq=ptq.pt --qat=qat.pt --eval-ptq --eval-origin` | Single run of `yolo_quantization/qat/nvidia_modelopt_yolo_qat.py` (does FP32 eval → PTQ calibrate → eval → QAT distill → eval). |
 | Histogram(MSE) calibration | `--calib-method entropy` (closest available — ModelOpt has no MSE; `entropy` shares the same histogram backend). |
 | Supervision (teacher-student) | `--qat-mode distill`: MSE on raw multi-scale detect outputs of teacher (FP32 frozen) vs student (quantized, trainable). |
 | `bash scripts/eval-trt.sh qat.pt` | Built into the same script — uses Ultralytics' `model.val()` with `data=coco.yaml, conf=0.001, iou=0.6`. |
@@ -279,7 +294,7 @@ Re-run export through the QAT script or add an export-only helper before relying
 
 1. **Calibration leak**: `val2017` is used for calibration *and* mAP eval. PTQ amax estimation is statistics-only (no gradients), so the typical leakage concern is mild — but for a rigorous benchmark, swap to a held-out slice of `train2017`.
 2. **Calibrator mismatch with yolov7_qat**: yolov7_qat uses `mse` histogram; this run uses `entropy`. If results diverge from the yolov7_qat baseline, try `--calib-method percentile --calib-percentile 99.99` as a third reference point, or add an `mse` option by passing `module.load_calib_amax("mse")` in `manual_histogram_quantize`.
-3. **Train subsample size**: 4000 images cover 2 epochs × 200 batches × 16 = 6400 sample-steps with 1.25× cycling. If `--qat-batches-per-epoch` or `--qat-epochs` is bumped, also bump the subsample.
+3. **Train subsample size**: 4000 images cover 3 epochs × 250 batches × 16 = 12000 sample-steps with 3× cycling. If `--qat-batches-per-epoch` or `--qat-epochs` is bumped materially, also bump the subsample.
 4. **Old archive cleanup**: `datasets/coco/{val2017.zip, test2017.zip, annotations_trainval2017.zip}` (~1.8 GB) can be deleted; data is already extracted.
 5. **Detect-head output quantization**: defaults to *enabled*. If PTQ mAP collapses, retry with `--disable-detect-output-quant` (the script handles this cleanly).
 6. **Residual-add quantizer patching** is on by default; necessary for clean Q/DQ ONNX export on YOLO bottleneck blocks. Disable with `--no-residual-add-quant` only when debugging.
