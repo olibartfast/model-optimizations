@@ -100,7 +100,18 @@ quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
 # PTQ-only ONNX (INT8/FP8/INT4)
 quantization_venv/bin/python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
   --models yolo11x --quant-modes int8 fp8 --calib-size 256
+
+# Custom Ultralytics dataset YAML; calibration can use train, val, or an image dir/list
+quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+  --models yolo26s --data configs/my_dataset.yaml --calib-source train
 ```
+
+Both canonical entry points accept `--data <dataset.yaml>`. The YAML should use
+the normal Ultralytics detection layout (`path`, `train`, `val`, `names`).
+`--calib-source` accepts `train`, `val`, the legacy COCO aliases
+`train2017`/`val2017`, or a direct path to an image directory or newline-delimited
+image list. The default remains COCO `configs/coco.yaml` with `val2017`
+calibration.
 
 ## Requirements
 
@@ -138,7 +149,6 @@ Tests:
 - [`tests/test_ptq_helpers.py`](tests/test_ptq_helpers.py) — unit tests for PTQ helpers
 
 Documentation:
-- [`docs/yolo26_int8_qat_paper.md`](docs/yolo26_int8_qat_paper.md) — write-up of the YOLO26 INT8 QAT distillation/supervised recovery recipe
 - [`docs/LINEAR_QUANTIZATION_THEORY.md`](docs/LINEAR_QUANTIZATION_THEORY.md) — background on linear quantization math
 - [`docs/readme_python3.12_on_old_ubuntu_version.md`](docs/readme_python3.12_on_old_ubuntu_version.md) — Python 3.12 via Deadsnakes PPA
 

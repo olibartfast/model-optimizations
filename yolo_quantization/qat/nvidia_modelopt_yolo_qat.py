@@ -6,8 +6,9 @@ Mirrors the structure of ``NVIDIA/Model-Optimizer/examples/cnn_qat/``
 (PTQ calibration -> mtq.quantize -> QAT fine-tune -> mto.save -> export),
 adapted for object detection:
 
-* Calibration uses COCO 2017 ``images/val2017`` images with Ultralytics' inference
-  preprocessing (letterbox + RGB + 0-1 float, NCHW).
+* Calibration uses images from the Ultralytics dataset YAML (COCO ``val2017``
+  by default) with Ultralytics' inference preprocessing (letterbox + RGB +
+  0-1 float, NCHW).
 * QAT fine-tuning is delegated to ``YOLO.train(data=coco.yaml, ...)`` because
   YOLO has its own detection loss, augmentation pipeline and trainer; the
   quantizer modules injected by ``mtq.quantize`` are preserved through
@@ -51,6 +52,7 @@ import time
 import traceback
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -58,13 +60,15 @@ import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 COCO_YAML = PROJECT_ROOT / "configs" / "coco.yaml"
+DEFAULT_DATA_YAML = COCO_YAML
 COCO_ROOT = PROJECT_ROOT / "datasets" / "coco"
 VAL_DIR = COCO_ROOT / "images" / "val2017"
 TRAIN_DIR = COCO_ROOT / "images" / "train2017"
 OUT_ROOT = PROJECT_ROOT / "runs" / "modelopt_qat"
 
 DEFAULT_MODELS = ("yolo11x", "yolo26x")
-CALIB_SOURCES = {"val2017": VAL_DIR, "train2017": TRAIN_DIR}
+CALIB_SOURCES = {"val": VAL_DIR, "val2017": VAL_DIR, "train": TRAIN_DIR, "train2017": TRAIN_DIR}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 # QAT recipe registry.
@@ -219,6 +223,92 @@ def _pin_seed(seed: int | None) -> int | None:
     return seed
 
 
+def _load_dataset_yaml(data_yaml: Path) -> dict[str, Any]:
+    import yaml
+
+    if not data_yaml.exists():
+        raise FileNotFoundError(f"Dataset YAML not found: {data_yaml}")
+    data = yaml.safe_load(data_yaml.read_text()) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Dataset YAML must contain a mapping: {data_yaml}")
+    return data
+
+
+def _resolve_existing_path(path: Path, data_yaml: Path) -> Path:
+    if path.is_absolute():
+        return path
+    candidates = [
+        (Path.cwd() / path),
+        (PROJECT_ROOT / path),
+        (data_yaml.parent / path),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve()
+
+
+def _first_split_value(value: Any, split: str) -> str:
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError(f"Dataset split {split!r} is empty")
+        value = value[0]
+    if value is None:
+        raise KeyError(f"Dataset YAML has no {split!r} split")
+    return str(value)
+
+
+def resolve_dataset_split(data_yaml: Path, split: str) -> Path:
+    """Resolve an Ultralytics dataset split (``train``/``val``) to a dir or image list."""
+    cfg = _load_dataset_yaml(data_yaml)
+    root_value = cfg.get("path", "")
+    root = _resolve_existing_path(Path(str(root_value)).expanduser(), data_yaml) if root_value else data_yaml.parent
+    split_value = Path(_first_split_value(cfg.get(split), split)).expanduser()
+    if split_value.is_absolute():
+        return split_value
+    candidates = [root / split_value, PROJECT_ROOT / split_value, data_yaml.parent / split_value]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve()
+
+
+def resolve_calib_source(source: str, data_yaml: Path) -> Path:
+    """Resolve calibration source aliases or an explicit image dir/list path."""
+    if source in ("train", "val"):
+        return resolve_dataset_split(data_yaml, source)
+    if source in CALIB_SOURCES and data_yaml.resolve() == DEFAULT_DATA_YAML.resolve():
+        return CALIB_SOURCES[source]
+    candidate = Path(source).expanduser()
+    if candidate.is_absolute() or candidate.exists() or any(sep in source for sep in ("/", "\\")):
+        return _resolve_existing_path(candidate, data_yaml)
+    if source.endswith("2017") and data_yaml.resolve() != DEFAULT_DATA_YAML.resolve():
+        split = "train" if source.startswith("train") else "val" if source.startswith("val") else None
+        if split:
+            return resolve_dataset_split(data_yaml, split)
+    valid = "train, val, val2017, train2017, or a path to an image directory/list"
+    raise ValueError(f"Unknown --calib-source {source!r}; expected {valid}")
+
+
+def _image_paths_from_source(source: Path) -> list[Path]:
+    """Collect calibration images from a directory or a newline-delimited image list."""
+    if not source.exists():
+        raise FileNotFoundError(f"Image source not found: {source}")
+    if source.is_dir():
+        return sorted(p for p in source.rglob("*") if p.suffix.lower() in IMAGE_SUFFIXES)
+    paths: list[Path] = []
+    for raw in source.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        p = Path(line).expanduser()
+        if not p.is_absolute():
+            candidates = [source.parent / p, PROJECT_ROOT / p, Path.cwd() / p]
+            p = next((c for c in candidates if c.exists()), candidates[0])
+        paths.append(p.resolve())
+    return [p for p in paths if p.suffix.lower() in IMAGE_SUFFIXES]
+
+
 # ---------------------------------------------------------------------------
 # Calibration (mirrors cnn_qat/torchvision_qat.py:calibrate closure pattern)
 # ---------------------------------------------------------------------------
@@ -241,7 +331,7 @@ def _letterbox(img: np.ndarray, new_shape: int = 640, color: int = 114) -> np.nd
 
 
 def build_calib_batches(
-    image_dir: Path,
+    image_source: Path,
     imgsz: int,
     batch: int,
     num_samples: int,
@@ -250,15 +340,9 @@ def build_calib_batches(
     """Return a list of CPU float32 NCHW batches for PTQ calibration."""
     import cv2
 
-    if not image_dir.exists():
-        raise FileNotFoundError(
-            f"Calibration image dir not found: {image_dir}. "
-            f"Run ./scripts/download_coco_dataset.sh first."
-        )
-
-    paths = sorted(image_dir.glob("*.jpg"))
+    paths = _image_paths_from_source(image_source)
     if not paths:
-        raise RuntimeError(f"No .jpg files in {image_dir}")
+        raise RuntimeError(f"No calibration images found in {image_source}")
 
     rng = random.Random(seed)
     rng.shuffle(paths)
@@ -289,11 +373,11 @@ def build_calib_batches(
 # ---------------------------------------------------------------------------
 
 
-def eval_on_coco_val(yolo, imgsz: int, batch: int, device: str) -> tuple[float, float, float]:
+def eval_on_dataset(yolo, data_yaml: Path, imgsz: int, batch: int, device: str) -> tuple[float, float, float]:
     """Return (mAP50, mAP50-95, seconds) via Ultralytics' detection validator."""
     t0 = time.time()
     results = yolo.val(
-        data=str(COCO_YAML),
+        data=str(data_yaml),
         imgsz=imgsz,
         batch=batch,
         conf=0.001,
@@ -988,6 +1072,7 @@ def _restore_modelopt_checkpoint(mto, model: torch.nn.Module, path: Path, torch_
 
 def _build_detection_trainer(
     weights: str,
+    data_yaml: Path,
     imgsz: int,
     batch: int,
     device: str,
@@ -997,7 +1082,7 @@ def _build_detection_trainer(
 
     overrides = {
         "model": weights,
-        "data": str(COCO_YAML),
+        "data": str(data_yaml),
         "imgsz": imgsz,
         "batch": batch,
         "device": device,
@@ -1064,6 +1149,7 @@ def _supervised_yolo_loss(student_model, student_outputs, batch_data):
 def run_distillation_qat(
     student_model: torch.nn.Module,
     teacher_weights: str,
+    data_yaml: Path,
     imgsz: int,
     batch: int,
     device: str,
@@ -1102,7 +1188,7 @@ def run_distillation_qat(
     if cloned_amax_states:
         print(f"  [qat] cloned {cloned_amax_states} quantizer amax state tensor(s) before training")
 
-    trainer = _build_detection_trainer(teacher_weights, imgsz, batch, device, workers)
+    trainer = _build_detection_trainer(teacher_weights, data_yaml, imgsz, batch, device, workers)
     trainer.model = student_model
     trainer.device = _resolve_device(device)
     trainer.stride = max(int(student_model.stride.max() if hasattr(student_model, "stride") else 32), 32)
@@ -1297,6 +1383,7 @@ def _select_sensitivity_candidates(
 
 def run_sensitivity_sweep(
     yolo,
+    data_yaml: Path,
     imgsz: int,
     batch: int,
     device: str,
@@ -1321,7 +1408,7 @@ def run_sensitivity_sweep(
         for quantizer in quantizers:
             quantizer.disable()
         try:
-            map50, mAP, secs = eval_on_coco_val(yolo, imgsz, batch, device)
+            map50, mAP, secs = eval_on_dataset(yolo, data_yaml, imgsz, batch, device)
             result = {
                 "name": name,
                 "map50": map50,
@@ -1361,6 +1448,7 @@ def perform_ptq_on_yolo(
     share_residual_add_scales: bool,
     disable_detect_output_quant: bool,
     calib_dir: Path = VAL_DIR,
+    data_yaml: Path = DEFAULT_DATA_YAML,
     keep_fp32_modules: list[str] | None = None,
     exclude_dfl_quant: bool = False,
 ) -> tuple[StageResult, int, int, int]:
@@ -1427,7 +1515,7 @@ def perform_ptq_on_yolo(
     ptq_stage.checkpoint = str(ptq_ckpt)
     print(f"  [ptq] saved {ptq_ckpt}")
 
-    map50, mAP, secs = eval_on_coco_val(yolo, imgsz, val_batch, device)
+    map50, mAP, secs = eval_on_dataset(yolo, data_yaml, imgsz, val_batch, device)
     ptq_stage.map50, ptq_stage.map, ptq_stage.seconds = map50, mAP, secs
     print(f"  [val/ptq] mAP50={map50:.4f} mAP50-95={mAP:.4f} ({secs:.1f}s)")
 
@@ -1467,6 +1555,7 @@ def run_qat_for_model(
     qat_eval_every: int = 0,
     qat_log_every: int = 0,
     calib_dir: Path = VAL_DIR,
+    data_yaml: Path = DEFAULT_DATA_YAML,
     keep_fp32_modules: list[str] | None = None,
     exclude_dfl_quant: bool = False,
     seed: int | None = None,
@@ -1499,7 +1588,7 @@ def run_qat_for_model(
     fp32_stage = StageResult(stage="fp32")
     if not skip_fp32_eval:
         try:
-            map50, mAP, secs = eval_on_coco_val(yolo, imgsz, val_batch, device)
+            map50, mAP, secs = eval_on_dataset(yolo, data_yaml, imgsz, val_batch, device)
             fp32_stage.map50, fp32_stage.map, fp32_stage.seconds = map50, mAP, secs
             print(f"  [val/fp32] mAP50={map50:.4f} mAP50-95={mAP:.4f} ({secs:.1f}s)")
         except Exception as e:
@@ -1535,7 +1624,7 @@ def run_qat_for_model(
                     f"{kept_modules} module(s) matching {keep_fp32_modules}"
                 )
             ptq_stage = StageResult(stage="ptq", checkpoint=str(from_ptq))
-            map50, mAP, secs = eval_on_coco_val(yolo, imgsz, val_batch, device)
+            map50, mAP, secs = eval_on_dataset(yolo, data_yaml, imgsz, val_batch, device)
             ptq_stage.map50, ptq_stage.map, ptq_stage.seconds = map50, mAP, secs
             print(f"  [val/ptq] mAP50={map50:.4f} mAP50-95={mAP:.4f} ({secs:.1f}s)")
         else:
@@ -1557,6 +1646,7 @@ def run_qat_for_model(
                 share_residual_add_scales,
                 disable_detect_output_quant,
                 calib_dir=calib_dir,
+                data_yaml=data_yaml,
                 keep_fp32_modules=keep_fp32_modules,
                 exclude_dfl_quant=exclude_dfl_quant,
             )
@@ -1571,6 +1661,7 @@ def run_qat_for_model(
         print(f"  [sensitivity] sweeping ptq modules (limit={sensitivity_max_layers})")
         sensitivity_results = run_sensitivity_sweep(
             yolo,
+            data_yaml,
             imgsz,
             val_batch,
             device,
@@ -1588,7 +1679,7 @@ def run_qat_for_model(
     def _qat_eval_callback(epoch_1based: int) -> dict | None:
         try:
             yolo.model.eval()
-            map50, mAP, secs = eval_on_coco_val(yolo, imgsz, val_batch, device)
+            map50, mAP, secs = eval_on_dataset(yolo, data_yaml, imgsz, val_batch, device)
         except Exception as exc:  # eval is best-effort; don't kill the run
             print(f"  [qat/eval] epoch {epoch_1based} FAILED: {exc}")
             return None
@@ -1625,6 +1716,7 @@ def run_qat_for_model(
             training_log = run_distillation_qat(
                 student_model=yolo.model,
                 teacher_weights=weights,
+                data_yaml=data_yaml,
                 imgsz=imgsz,
                 batch=batch,
                 device=device,
@@ -1643,7 +1735,7 @@ def run_qat_for_model(
             )
         else:
             yolo.train(
-                data=str(COCO_YAML),
+                data=str(data_yaml),
                 epochs=qat_epochs,
                 imgsz=imgsz,
                 batch=batch,
@@ -1664,7 +1756,7 @@ def run_qat_for_model(
         qat_stage.checkpoint = str(qat_ckpt)
         print(f"  [qat] saved {qat_ckpt}")
 
-        map50, mAP, secs = eval_on_coco_val(yolo, imgsz, val_batch, device)
+        map50, mAP, secs = eval_on_dataset(yolo, data_yaml, imgsz, val_batch, device)
         qat_stage.map50, qat_stage.map, qat_stage.seconds = map50, mAP, secs
         print(f"  [val/qat] mAP50={map50:.4f} mAP50-95={mAP:.4f} ({secs:.1f}s)")
     except Exception as e:
@@ -1699,6 +1791,7 @@ def run_qat_for_model(
             print(f"  [sensitivity] sweeping qat modules (limit={sensitivity_max_layers})")
             sensitivity_results = run_sensitivity_sweep(
                 yolo,
+                data_yaml,
                 imgsz,
                 val_batch,
                 device,
@@ -1712,7 +1805,8 @@ def run_qat_for_model(
 
     config_snapshot = {
         "seed": seed,
-        "calib_source": calib_dir.name,
+        "data": str(data_yaml),
+        "calib_source": str(calib_dir),
         "calib_size": calib_size,
         "calib_method": calib_method,
         "calib_percentile": calib_percentile,
@@ -1816,7 +1910,8 @@ def parse_sensitivity_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS), help="Ultralytics checkpoint stem(s) (e.g. yolo11n)")
-    p.add_argument("--calib-size", type=int, default=260, help="# val2017 images for PTQ (unless --from-ptq)")
+    p.add_argument("--data", type=Path, default=DEFAULT_DATA_YAML, help="Ultralytics dataset YAML for validation/training")
+    p.add_argument("--calib-size", type=int, default=260, help="# images for PTQ calibration (unless --from-ptq)")
     p.add_argument(
         "--calib-method",
         choices=("max", "entropy", "percentile", "smoothquant"),
@@ -1861,6 +1956,11 @@ def parse_sensitivity_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Use an existing mto.save() PTQ checkpoint; requires a single --models entry and skips PTQ",
     )
     p.add_argument(
+        "--calib-source",
+        default="val2017",
+        help="PTQ calibration source: train, val, val2017, train2017, or an explicit image directory/list path",
+    )
+    p.add_argument(
         "--out",
         type=Path,
         default=OUT_ROOT / "sensitivity_report.json",
@@ -1873,14 +1973,17 @@ def run_sensitivity_subcommand(argv: list[str] | None = None) -> int:
     from ultralytics import YOLO
 
     args = parse_sensitivity_args(argv)
-    if not COCO_YAML.exists():
-        print(f"ERROR: COCO config not found: {COCO_YAML}", file=sys.stderr)
+    data_yaml = args.data
+    if not data_yaml.exists():
+        print(f"ERROR: dataset config not found: {data_yaml}", file=sys.stderr)
         return 2
-    if not VAL_DIR.exists():
-        print(
-            f"ERROR: {VAL_DIR} not found. Run ./scripts/download_coco_dataset.sh first.",
-            file=sys.stderr,
-        )
+    try:
+        calib_dir = resolve_calib_source(args.calib_source, data_yaml)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if not calib_dir.exists():
+        print(f"ERROR: calibration source not found: {calib_dir}", file=sys.stderr)
         return 2
     if args.from_ptq is not None and len(args.models) != 1:
         print("ERROR: --from-ptq requires exactly one --models name", file=sys.stderr)
@@ -1927,15 +2030,18 @@ def run_sensitivity_subcommand(argv: list[str] | None = None) -> int:
                     patch_residual_adds=not args.no_residual_add_quant,
                     share_residual_add_scales=not args.no_share_residual_add_scales,
                     disable_detect_output_quant=args.disable_detect_output_quant,
+                    calib_dir=calib_dir,
+                    data_yaml=data_yaml,
                 )
             except Exception as e:
                 print(f"  [sensitivity] PTQ failed: {e}", file=sys.stderr)
                 return 1
 
-        map50, mAP, _ = eval_on_coco_val(yolo, args.imgsz, args.val_batch, args.device)
+        map50, mAP, _ = eval_on_dataset(yolo, data_yaml, args.imgsz, args.val_batch, args.device)
         print(f"  [sensitivity] PTQ baseline mAP50={map50:.4f} mAP50-95={mAP:.4f}")
         sens = run_sensitivity_sweep(
             yolo,
+            data_yaml,
             args.imgsz,
             args.val_batch,
             args.device,
@@ -1956,6 +2062,7 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS))
+    p.add_argument("--data", type=Path, default=DEFAULT_DATA_YAML, help="Ultralytics dataset YAML for validation and QAT training")
     p.add_argument("--qat-epochs", type=int, default=10, help="QAT fine-tune epochs")
     p.add_argument("--qat-lr", type=float, default=1e-5, help="Constant LR for QAT fine-tune")
     p.add_argument("--qat-low-lr", type=float, default=1e-6, help="Low LR used on the outer legs of the distillation schedule")
@@ -1984,7 +2091,7 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Weight on COCO supervised detection loss in distill mode (0 disables it)",
     )
     p.add_argument("--optimizer", default="Adam", help="Ultralytics optimizer for QAT fine-tune")
-    p.add_argument("--calib-size", type=int, default=260, help="# val2017 images for PTQ")
+    p.add_argument("--calib-size", type=int, default=260, help="# images for PTQ calibration")
     p.add_argument(
         "--calib-method",
         choices=("max", "entropy", "percentile", "smoothquant"),
@@ -2088,9 +2195,8 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--calib-source",
-        choices=tuple(CALIB_SOURCES.keys()),
         default="val2017",
-        help="Image source for PTQ calibration (val2017 = current default; train2017 avoids the val leak)",
+        help="PTQ calibration source: train, val, val2017, train2017, or an explicit image directory/list path",
     )
     p.add_argument(
         "--keep-fp32-modules",
@@ -2138,22 +2244,17 @@ def main(argv: list[str] | None = None) -> int:
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     _pin_seed(args.seed)
 
-    if not COCO_YAML.exists():
-        print(f"ERROR: COCO config not found: {COCO_YAML}", file=sys.stderr)
+    data_yaml = args.data
+    if not data_yaml.exists():
+        print(f"ERROR: dataset config not found: {data_yaml}", file=sys.stderr)
         return 2
-    calib_dir = CALIB_SOURCES[args.calib_source]
+    try:
+        calib_dir = resolve_calib_source(args.calib_source, data_yaml)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     if not calib_dir.exists():
-        print(
-            f"ERROR: {calib_dir} not found (selected via --calib-source {args.calib_source}). "
-            f"Run ./scripts/download_coco_dataset.sh first.",
-            file=sys.stderr,
-        )
-        return 2
-    if not VAL_DIR.exists():
-        print(
-            f"ERROR: {VAL_DIR} not found. Run ./scripts/download_coco_dataset.sh first.",
-            file=sys.stderr,
-        )
+        print(f"ERROR: calibration source not found: {calib_dir}", file=sys.stderr)
         return 2
     if args.from_ptq is not None and len(args.models) != 1:
         print("ERROR: --from-ptq requires exactly one --models entry", file=sys.stderr)
@@ -2196,6 +2297,7 @@ def main(argv: list[str] | None = None) -> int:
                     qat_eval_every=args.qat_eval_every,
                     qat_log_every=args.qat_log_every,
                     calib_dir=calib_dir,
+                    data_yaml=data_yaml,
                     keep_fp32_modules=args.keep_fp32_modules or None,
                     exclude_dfl_quant=args.exclude_dfl_quant,
                     seed=args.seed,

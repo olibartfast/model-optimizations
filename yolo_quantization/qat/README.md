@@ -249,6 +249,23 @@ quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s --calib-source train2017 --calib-size 260
 ```
 
+Run against a custom Ultralytics detection dataset:
+
+```bash
+quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+  --models yolo26s \
+  --data configs/my_dataset.yaml \
+  --calib-source train \
+  --calib-size 260
+```
+
+`--data` is passed to Ultralytics for validation and QAT training. The YAML
+should provide the usual `path`, `train`, `val`, and `names` fields.
+`--calib-source` accepts `train`, `val`, legacy COCO aliases
+`train2017`/`val2017`, or a direct path to an image directory or image-list
+text file. For custom datasets, using `train` for calibration avoids calibrating
+on the validation split that is later used for mAP.
+
 Run the runtime experiment matrices (each subrun copies its outputs into
 `runs/modelopt_qat_experiments/<mode>/<tag>/` so the canonical tree is not
 overwritten):
