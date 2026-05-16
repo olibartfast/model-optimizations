@@ -67,6 +67,143 @@ DEFAULT_MODELS = ("yolo11x", "yolo26x")
 CALIB_SOURCES = {"val2017": VAL_DIR, "train2017": TRAIN_DIR}
 
 
+# QAT recipe registry.
+#
+# Each entry holds the *default overrides* a recipe applies on top of the
+# argparse defaults. Only keys the user did not explicitly pass on the CLI
+# are overwritten (see :func:`_apply_recipe`). The `auto` recipe picks one of
+# the named recipes per model: E2E YOLO26 stays on the distillation recipe
+# that earned the recorded yolo26s baseline; single-head models (YOLOv8/v11)
+# switch to the UBON-derived supervised recipe that ships DFL/output
+# exclusion and a higher LR.
+#
+# References:
+#   - UBON QAT (https://github.com/ubonpartners/ultralytics/blob/.../UBON_QAT.md):
+#     lr0=1e-4, 5 epochs, max calibration, DFL+output quantizers disabled,
+#     no distillation, augmentations off.
+#   - NVIDIA ModelOpt PyTorch quantization guide: QAT for ~10% of original
+#     training epochs; quantizer scales frozen during QAT.
+QAT_RECIPES: dict[str, dict] = {
+    "yolo26-distill": {
+        # Preserves the recorded yolo26s baseline exactly. Do not modify
+        # without re-running the full yolo26s metrics table.
+        "qat_epochs": 10,
+        "qat_batches_per_epoch": 200,
+        "qat_lr": 1e-5,
+        "qat_low_lr": 1e-6,
+        "qat_distill_weight": 1.0,
+        "qat_supervised_weight": 1.0,
+        "calib_method": "entropy",
+        "calib_size": 260,
+        "disable_detect_output_quant": False,
+        "exclude_dfl_quant": False,
+    },
+    "yolo11-supervised": {
+        # UBON-derived: supervised-only fine-tune, max calibration, DFL/output
+        # quantizers excluded. Targets single-head v8/v11/v12-class models
+        # where PTQ is already near-lossless and the distillation recipe
+        # over-fits.
+        #
+        # Empirical note (2026-05-16): on yolo11s this recipe's lr=1e-4 was
+        # catastrophic (epoch 2 collapsed to mAP50-95=0.3807). Kept as an
+        # explicit option for cases where supervised-only with high LR is
+        # appropriate (e.g. larger PTQ-FP32 gap), but `yolo11-distill` is
+        # the recommended default for single-head models.
+        "qat_epochs": 5,
+        "qat_batches_per_epoch": 200,
+        "qat_lr": 1e-4,
+        "qat_low_lr": 1e-5,
+        "qat_distill_weight": 0.0,
+        "qat_supervised_weight": 1.0,
+        "calib_method": "max",
+        "calib_size": 1024,
+        "disable_detect_output_quant": True,
+        "exclude_dfl_quant": True,
+    },
+    "yolo11-distill": {
+        # Hybrid: keep yolo26-distill's loss schedule (both teacher MSE and
+        # COCO supervised at lr=1e-5 with low/high/low ladder), but apply the
+        # UBON-derived PTQ exclusions (DFL and Detect output quantizers
+        # disabled, `max` calibration). Targets single-head v8/v11/v12 where
+        # PTQ alone is already near-lossless: the exclusions lift PTQ by
+        # ~+0.001 mAP50-95, and the conservative distillation schedule lets
+        # QAT match-or-exceed that baseline instead of collapsing it.
+        "qat_epochs": 10,
+        "qat_batches_per_epoch": 200,
+        "qat_lr": 1e-5,
+        "qat_low_lr": 1e-6,
+        "qat_distill_weight": 1.0,
+        "qat_supervised_weight": 1.0,
+        "calib_method": "max",
+        "calib_size": 1024,
+        "disable_detect_output_quant": True,
+        "exclude_dfl_quant": True,
+    },
+}
+
+
+def _resolve_recipe(name: str, model_name: str | None, is_e2e: bool | None) -> str:
+    """Map ``name`` (possibly ``'auto'``) to a concrete recipe key.
+
+    Resolution order:
+      * explicit recipe name -> use it.
+      * ``auto`` + caller-provided ``is_e2e`` flag -> distill for E2E, supervised otherwise.
+      * ``auto`` + ``model_name`` only -> use a name heuristic (``yolo26*`` is E2E).
+      * fallback -> ``yolo26-distill`` (preserves existing default behaviour).
+    """
+    if name != "auto":
+        if name not in QAT_RECIPES:
+            raise ValueError(f"Unknown QAT recipe: {name!r}. Choices: {sorted(QAT_RECIPES)}")
+        return name
+    # Single-head models default to the safer distill variant: empirically
+    # supervised-only at lr=1e-4 collapsed yolo11s mAP, so we pick the loss
+    # schedule that anchored yolo26s and combine it with single-head PTQ
+    # exclusions. yolo26-supervised stays on the recorded distill recipe.
+    if is_e2e is not None:
+        return "yolo26-distill" if is_e2e else "yolo11-distill"
+    if model_name is not None:
+        return "yolo26-distill" if model_name.lower().startswith("yolo26") else "yolo11-distill"
+    return "yolo26-distill"
+
+
+def _apply_recipe(args, explicit_flags: set[str]) -> str:
+    """Apply ``args.qat_recipe`` defaults in-place for any flag the user did not pass.
+
+    Returns the resolved recipe name (``yolo26-distill`` or ``yolo11-supervised``).
+    ``explicit_flags`` is the set of long flag names (``"--qat-lr"`` etc.) that
+    appeared on the command line — we only fill in values for flags absent from
+    that set, so explicit CLI flags always win.
+    """
+    # For --qat-recipe=auto we need the model name (the first --models entry)
+    # to pick between the two named recipes.
+    model_hint = args.models[0] if getattr(args, "models", None) else None
+    resolved = _resolve_recipe(args.qat_recipe, model_hint, is_e2e=None)
+    overrides = QAT_RECIPES[resolved]
+    flag_map = {
+        "qat_epochs": "--qat-epochs",
+        "qat_batches_per_epoch": "--qat-batches-per-epoch",
+        "qat_lr": "--qat-lr",
+        "qat_low_lr": "--qat-low-lr",
+        "qat_distill_weight": "--qat-distill-weight",
+        "qat_supervised_weight": "--qat-supervised-weight",
+        "calib_method": "--calib-method",
+        "calib_size": "--calib-size",
+        "disable_detect_output_quant": "--disable-detect-output-quant",
+        "exclude_dfl_quant": "--exclude-dfl-quant",
+    }
+    applied: list[str] = []
+    for key, value in overrides.items():
+        if flag_map[key] in explicit_flags:
+            continue
+        setattr(args, key, value)
+        applied.append(f"{key}={value}")
+    if applied:
+        print(
+            f"[recipe={resolved}] applied defaults: " + ", ".join(applied)
+        )
+    return resolved
+
+
 def _pin_seed(seed: int | None) -> int | None:
     if seed is None:
         return None
@@ -527,10 +664,12 @@ def _resolve_device(device: str) -> torch.device:
 
 def _raise_modelopt_import_error(exc: Exception) -> None:
     raise RuntimeError(
-        "modelopt.torch is not importable in this environment. "
-        "The current venv is missing optional torch dependencies "
-        "(observed missing module: 'pulp'). Install the full ModelOpt torch extras "
-        "or add 'pulp' to the environment before running the QAT/PTQ/export pipeline."
+        f"modelopt.torch sub-module failed to import: {exc!r}. "
+        "The current venv is missing one of ModelOpt's optional torch extras. "
+        "Known dependencies the export path pulls in: 'pulp', 'huggingface_hub', "
+        "'onnxconverter_common'. Install whichever module is named in the error "
+        "above; pip install --no-build-isolation --extra-index-url "
+        "https://pypi.ngc.nvidia.com 'nvidia-modelopt[torch,onnx]' is the catch-all."
     ) from exc
 
 
@@ -754,6 +893,29 @@ def _amax_drift_stats(
     }
 
 
+def find_dfl_module_paths(model: torch.nn.Module) -> list[str]:
+    """Return ``named_modules()`` paths for every Ultralytics DFL module.
+
+    DFL is the Distribution-Focal-Loss head used by YOLOv8 / YOLO11 / YOLO26 to
+    convert distribution-over-bins outputs into continuous box-regression
+    coordinates. Per the UBON QAT recipe (and consistent with NVIDIA's
+    sensitivity-to-quantization observations for similar heads), DFL weights
+    and inputs should be excluded from INT8 quantization — quantizing the
+    discrete bin probabilities causes outsized mAP regressions because tiny
+    numerical errors compound across the cumulative-distribution decode.
+    """
+    paths: list[str] = []
+    for name, module in model.named_modules():
+        if type(module).__name__ == "DFL":
+            paths.append(name)
+        elif name.endswith(".dfl") or ".dfl." in name:
+            # Defensive: catch DFL submodules even if class lookup misses.
+            paths.append(name)
+    # Deduplicate while preserving order.
+    seen: set[str] = set()
+    return [p for p in paths if not (p in seen or seen.add(p))]
+
+
 def disable_module_quantizers(model: torch.nn.Module, prefixes: list[str]) -> tuple[int, int]:
     """Disable every quantizer attached to modules whose ``named_modules()`` path matches a prefix.
 
@@ -831,6 +993,23 @@ def _build_detection_trainer(
     return DetectionTrainer(overrides=overrides)
 
 
+def _is_e2e_yolo_model(model: torch.nn.Module) -> bool:
+    """Detect whether ``model`` uses YOLO26's end-to-end dual-head structure.
+
+    Single-head detectors (YOLOv8 / YOLO11 / YOLO12 / YOLO13) use ``v8DetectionLoss``;
+    YOLO26 uses ``E2ELoss`` with ``.one2one`` and ``.one2many`` sub-criteria.
+    The check initializes the criterion if needed but does not run a forward pass.
+    Errors fall through to ``False`` so this can never block a legitimate run.
+    """
+    if getattr(model, "criterion", None) is None:
+        try:
+            model.criterion = model.init_criterion()
+        except Exception:
+            return False
+    crit = model.criterion
+    return hasattr(crit, "one2one") and hasattr(crit, "one2many")
+
+
 def _supervised_yolo_loss(student_model, student_outputs, batch_data):
     """Compute YOLO supervised detection loss; for YOLO26 use the one2one head only.
 
@@ -869,7 +1048,7 @@ def run_distillation_qat(
     workers: int,
     distill_weight: float = 1.0,
     supervised_weight: float = 1.0,
-    freeze_teacher_bn: bool = False,
+    freeze_teacher_bn: bool | None = None,
     freeze_student_bn: bool = False,
     log_every: int = 0,
     eval_callback=None,
@@ -905,11 +1084,23 @@ def run_distillation_qat(
     dataloader = trainer.get_dataloader(trainer.data["train"], batch_size=batch, rank=-1, mode="train")
 
     teacher = YOLO(teacher_weights).model.to(trainer.device)
-    teacher.train()
-    frozen_teacher_bn = _freeze_batch_norm_stats(teacher) if freeze_teacher_bn else 0
+    teacher.train()  # required by both E2E and single-head YOLOs to emit raw multi-scale outputs
+
+    # freeze_teacher_bn=None means "auto": single-head YOLOs (v8/v11/etc.) need
+    # BN running stats frozen so the teacher reference is stable across batches;
+    # YOLO26's BN drift is measured as +0.00003 mAP (noise) so we leave it alone
+    # by default to preserve the recorded yolo26s baseline exactly.
+    is_e2e = _is_e2e_yolo_model(student_model)
+    resolved_freeze_teacher_bn = (
+        freeze_teacher_bn if freeze_teacher_bn is not None else (not is_e2e)
+    )
+    print(f"  [qat] head type: {'E2E (one2one/one2many)' if is_e2e else 'single-head'}")
+    frozen_teacher_bn = (
+        _freeze_batch_norm_stats(teacher) if resolved_freeze_teacher_bn else 0
+    )
     if frozen_teacher_bn:
         print(f"  [qat] froze {frozen_teacher_bn} teacher BatchNorm module(s)")
-    elif freeze_teacher_bn:
+    elif resolved_freeze_teacher_bn:
         print("  [qat] requested teacher BatchNorm freeze, but found no BatchNorm modules")
     for p in teacher.parameters():
         p.requires_grad = False
@@ -1145,6 +1336,7 @@ def perform_ptq_on_yolo(
     disable_detect_output_quant: bool,
     calib_dir: Path = VAL_DIR,
     keep_fp32_modules: list[str] | None = None,
+    exclude_dfl_quant: bool = False,
 ) -> tuple[StageResult, int, int, int]:
     """Run PTQ (manual max/entropy/percentile or ``mtq.quantize`` for smoothquant) and return the PTQ stage + stats."""
     ptq_stage = StageResult(stage="ptq")
@@ -1184,6 +1376,13 @@ def perform_ptq_on_yolo(
     if disable_detect_output_quant:
         print(f"  [ptq] policy-disabled {disabled_detect_outputs} detect-head output quantizer(s)")
 
+    if exclude_dfl_quant:
+        dfl_paths = find_dfl_module_paths(yolo.model)
+        dfl_mods, dfl_q = disable_module_quantizers(yolo.model, dfl_paths)
+        print(
+            f"  [ptq] dfl-exclude: disabled {dfl_q} quantizer(s) on "
+            f"{dfl_mods} module(s) under {dfl_paths or '[]'}"
+        )
     if keep_fp32_modules:
         kept_modules, kept_quantizers = disable_module_quantizers(yolo.model, keep_fp32_modules)
         print(
@@ -1234,7 +1433,7 @@ def run_qat_for_model(
     fuse_before_quant: bool,
     patch_residual_adds: bool,
     share_residual_add_scales: bool,
-    freeze_teacher_bn: bool,
+    freeze_teacher_bn: bool | None,
     freeze_student_bn: bool,
     sensitivity: bool,
     sensitivity_stage: str,
@@ -1243,7 +1442,9 @@ def run_qat_for_model(
     qat_log_every: int = 0,
     calib_dir: Path = VAL_DIR,
     keep_fp32_modules: list[str] | None = None,
+    exclude_dfl_quant: bool = False,
     seed: int | None = None,
+    recipe: str | None = None,
     from_ptq: Path | None = None,
 ) -> ModelResult:
     from ultralytics import YOLO
@@ -1292,6 +1493,13 @@ def run_qat_for_model(
                     print(f"  [ptq] patched {patched_adds} residual add module(s) before restore")
             print(f"  [ptq] restoring {from_ptq}")
             yolo.model = _restore_modelopt_checkpoint(mto, yolo.model, from_ptq, torch_device)
+            if exclude_dfl_quant:
+                dfl_paths = find_dfl_module_paths(yolo.model)
+                dfl_mods, dfl_q = disable_module_quantizers(yolo.model, dfl_paths)
+                print(
+                    f"  [ptq] dfl-exclude: disabled {dfl_q} quantizer(s) on "
+                    f"{dfl_mods} module(s) under {dfl_paths or '[]'}"
+                )
             if keep_fp32_modules:
                 kept_modules, kept_quantizers = disable_module_quantizers(
                     yolo.model, keep_fp32_modules
@@ -1324,6 +1532,7 @@ def run_qat_for_model(
                 disable_detect_output_quant,
                 calib_dir=calib_dir,
                 keep_fp32_modules=keep_fp32_modules,
+                exclude_dfl_quant=exclude_dfl_quant,
             )
     except Exception as e:
         ptq_stage = StageResult(stage="ptq", error=str(e))
@@ -1358,7 +1567,17 @@ def run_qat_for_model(
             print(f"  [qat/eval] epoch {epoch_1based} FAILED: {exc}")
             return None
         finally:
+            # Restore training state after Ultralytics' val pipeline. Three
+            # things can be left in a non-trainable state by val():
+            #   1. module.training flags (need .train()),
+            #   2. ModelOpt quantizer buffers marked inference-mode
+            #      (need _prepare_quantized_model_for_training),
+            #   3. parameter requires_grad flags (Ultralytics' validator path
+            #      can flip them via AutoBackend / fuse interactions).
+            # Restoring all three keeps the next training backward valid.
             yolo.model.train()
+            _prepare_quantized_model_for_training(yolo.model)
+            _trainable_parameters(yolo.model)
         print(
             f"  [qat/eval] epoch {epoch_1based} mAP50={map50:.4f} "
             f"mAP50-95={mAP:.4f} ({secs:.1f}s)"
@@ -1484,6 +1703,8 @@ def run_qat_for_model(
         "val_batch": val_batch,
         "disable_detect_output_quant": disable_detect_output_quant,
         "keep_fp32_modules": keep_fp32_modules or [],
+        "exclude_dfl_quant": exclude_dfl_quant,
+        "recipe": recipe,
         "freeze_teacher_bn": freeze_teacher_bn,
         "freeze_student_bn": freeze_student_bn,
     }
@@ -1773,9 +1994,28 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Use Ultralytics' exporter instead of ModelOpt's Torch ONNX export utility",
     )
     p.add_argument(
+        "--qat-recipe",
+        choices=("auto", *QAT_RECIPES.keys()),
+        default="auto",
+        help=(
+            "Named QAT hyperparameter recipe. 'auto' picks 'yolo26-distill' for E2E "
+            "models (yolo26*) and 'yolo11-supervised' for single-head models "
+            "(YOLOv8/v11/etc.). Recipe values fill in only flags the user didn't pass; "
+            "explicit CLI flags always override."
+        ),
+    )
+    p.add_argument(
         "--disable-detect-output-quant",
         action="store_true",
         help="Disable output quantizers on Ultralytics Detect heads after quantization",
+    )
+    p.add_argument(
+        "--exclude-dfl-quant",
+        action="store_true",
+        help=(
+            "Disable quantizers on every Ultralytics DFL module. Default off (preserves "
+            "the yolo26s baseline) but auto-enabled by --qat-recipe yolo11-supervised."
+        ),
     )
     p.add_argument(
         "--no-fuse-before-quant",
@@ -1794,8 +2034,13 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--freeze-teacher-bn",
-        action="store_true",
-        help="Keep teacher BatchNorm running stats fixed during distillation while preserving YOLO26 train-mode outputs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Force teacher BatchNorm running stats fixed (or --no-freeze-teacher-bn to force-off). "
+            "Default: auto — freeze for single-head models (YOLOv8/v11/etc.), "
+            "leave open for E2E YOLO26 to preserve the recorded yolo26s baseline."
+        ),
     )
     p.add_argument(
         "--freeze-student-bn",
@@ -1860,6 +2105,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_sensitivity_subcommand(argv[1:])
 
     args = parse_qat_args(argv)
+    # Capture explicit CLI flags so the recipe layer doesn't overwrite them.
+    explicit_flags = {tok for tok in argv if tok.startswith("--")}
+    resolved_recipe = _apply_recipe(args, explicit_flags)
+    args.resolved_recipe = resolved_recipe
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     _pin_seed(args.seed)
 
@@ -1922,7 +2171,9 @@ def main(argv: list[str] | None = None) -> int:
                     qat_log_every=args.qat_log_every,
                     calib_dir=calib_dir,
                     keep_fp32_modules=args.keep_fp32_modules or None,
+                    exclude_dfl_quant=args.exclude_dfl_quant,
                     seed=args.seed,
+                    recipe=resolved_recipe,
                     from_ptq=args.from_ptq,
                 )
             )

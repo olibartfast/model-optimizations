@@ -62,10 +62,15 @@ quantization_venv/bin/python -m pytest tests/test_qat_helpers.py::test_distill_e
 **Run QAT (full pipeline: FP32 eval → PTQ calibrate → QAT distill → eval → ONNX)**:
 ```bash
 quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
-  --models yolo26s --qat-epochs 10 --qat-batches-per-epoch 200 \
-  --calib-size 260 --imgsz 640 --batch 10 --val-batch 8 --device 0 \
+  --models yolo26s --qat-recipe auto \
   --qat-log-every 20 --qat-eval-every 5 --seed 0
 ```
+
+`--qat-recipe auto` (default) picks `yolo26-distill` for E2E yolo26 models and
+`yolo11-distill` for single-head models (YOLOv8 / YOLO11 / etc.). The
+single-head recipe **excludes DFL and Detect-head output quantizers** and
+uses `max` calibration; without those, single-head QAT regresses below PTQ.
+See `yolo_quantization/qat/README.md` for the full recipe table.
 
 `--qat-log-every N` emits a `[qat/distill] step k/B` heartbeat every N batches.
 `--qat-eval-every N` runs a COCO val pass every N epochs (and on the final one),

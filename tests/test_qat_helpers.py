@@ -333,6 +333,111 @@ def test_disable_module_quantizers_empty_prefixes_noop():
     assert module.disable_module_quantizers(root, []) == (0, 0)
 
 
+def test_find_dfl_module_paths_finds_class_and_namesuffix():
+    module = _load_qat_module()
+
+    class DFL(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Conv2d(1, 1, 1)
+
+    root = torch.nn.Module()
+    root.add_module("head", torch.nn.Module())
+    root.head.add_module("dfl", DFL())
+    root.add_module("other", torch.nn.Conv2d(1, 1, 1))
+
+    paths = module.find_dfl_module_paths(root)
+    assert "head.dfl" in paths
+    assert "head.dfl.conv" in paths
+    # The non-DFL Conv2d sibling must not match.
+    assert "other" not in paths
+
+
+def test_resolve_recipe_picks_distill_for_e2e_and_for_single_head():
+    module = _load_qat_module()
+    assert module._resolve_recipe("auto", "yolo26s", None) == "yolo26-distill"
+    assert module._resolve_recipe("auto", "yolo26x", None) == "yolo26-distill"
+    # Auto resolution prefers the safer hybrid distill recipe for single-head models.
+    assert module._resolve_recipe("auto", "yolo11s", None) == "yolo11-distill"
+    assert module._resolve_recipe("auto", "yolov8n", None) == "yolo11-distill"
+    # explicit recipe name always wins
+    assert module._resolve_recipe("yolo26-distill", "yolo11s", None) == "yolo26-distill"
+    assert module._resolve_recipe("yolo11-supervised", "yolo11s", None) == "yolo11-supervised"
+    # is_e2e overrides the name heuristic
+    assert module._resolve_recipe("auto", "yolo11s", is_e2e=True) == "yolo26-distill"
+
+
+def test_resolve_recipe_rejects_unknown():
+    module = _load_qat_module()
+    with pytest.raises(ValueError):
+        module._resolve_recipe("typo", "yolo11s", None)
+
+
+def test_apply_recipe_respects_explicit_flags():
+    module = _load_qat_module()
+
+    class A:
+        pass
+
+    a = A()
+    a.qat_recipe = "yolo11-supervised"
+    a.models = ["yolo11s"]
+    # argparse-side defaults (yolo26-distill flavor)
+    a.qat_epochs = 10
+    a.qat_batches_per_epoch = 200
+    a.qat_lr = 1e-5
+    a.qat_low_lr = 1e-6
+    a.qat_distill_weight = 1.0
+    a.qat_supervised_weight = 1.0
+    a.calib_method = "entropy"
+    a.calib_size = 260
+    a.disable_detect_output_quant = False
+    a.exclude_dfl_quant = False
+
+    # User explicitly passed --qat-epochs and --qat-supervised-weight.
+    resolved = module._apply_recipe(a, {"--qat-epochs", "--qat-supervised-weight"})
+
+    assert resolved == "yolo11-supervised"
+    # Explicit flags preserved.
+    assert a.qat_epochs == 10
+    assert a.qat_supervised_weight == 1.0
+    # Recipe defaults applied for unset flags.
+    assert a.qat_lr == 1e-4
+    assert a.calib_method == "max"
+    assert a.disable_detect_output_quant is True
+    assert a.exclude_dfl_quant is True
+
+
+def test_apply_recipe_yolo26_distill_preserves_baseline():
+    """Critical: yolo26-distill recipe must not mutate the recorded defaults."""
+    module = _load_qat_module()
+
+    class A:
+        pass
+
+    a = A()
+    a.qat_recipe = "yolo26-distill"
+    a.models = ["yolo26s"]
+    a.qat_epochs = 10
+    a.qat_batches_per_epoch = 200
+    a.qat_lr = 1e-5
+    a.qat_low_lr = 1e-6
+    a.qat_distill_weight = 1.0
+    a.qat_supervised_weight = 1.0
+    a.calib_method = "entropy"
+    a.calib_size = 260
+    a.disable_detect_output_quant = False
+    a.exclude_dfl_quant = False
+
+    resolved = module._apply_recipe(a, set())
+    assert resolved == "yolo26-distill"
+    assert a.qat_lr == 1e-5
+    assert a.qat_distill_weight == 1.0
+    assert a.calib_method == "entropy"
+    assert a.exclude_dfl_quant is False
+    assert a.disable_detect_output_quant is False
+
+
 def test_write_qat_train_csv_emits_header_and_rows(tmp_path):
     module = _load_qat_module()
     rows = [

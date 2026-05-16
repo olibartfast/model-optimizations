@@ -112,6 +112,35 @@ Important QAT fixes already in the canonical script:
 
 Avoid `--qat-mode ultralytics`: `YOLO.train()` rebuilds the model from YAML and drops ModelOpt quantizer modules.
 
+## Recipes
+
+`--qat-recipe` selects a bundle of hyperparameters. The default `auto` picks
+per model family (yolo26* → `yolo26-distill`; everything else →
+`yolo11-distill`). Explicit CLI flags always win over recipe defaults.
+
+| Recipe | Targets | LR ladder | Loss | Calibration | Detect output Q | DFL Q | Epochs |
+|---|---|---|---|---|---|---|---|
+| `yolo26-distill` | E2E dual-head (yolo26*) | 1e-5 peak / 1e-6 low | distill (1.0) + supervised (1.0) | entropy, 260 imgs | enabled | enabled | 10 |
+| `yolo11-distill` | Single-head (v8/v11/…) | 1e-5 peak / 1e-6 low | distill (1.0) + supervised (1.0) | **max, 1024 imgs** | **disabled** | **disabled** | 10 |
+| `yolo11-supervised` | Single-head, larger PTQ-FP32 gap (rare) | 1e-4 peak / 1e-5 low | supervised-only (1.0) | max, 1024 imgs | disabled | disabled | 5 |
+
+Why the single-head recipe differs:
+
+- **DFL excluded** — Distribution-Focal-Loss outputs encode the distribution
+  over box-regression bins; INT8 quantization of these probabilities
+  compounds across the decode and is a large mAP regressor for single-head
+  YOLOs. yolo26 uses E2E head architecture where `model.23.dfl` is an
+  `Identity` no-op, so this flag is a no-op there.
+- **Detect-head output quantizers disabled** — same reasoning; the head
+  outputs have a wide dynamic range that INT8 cannot represent without
+  cost.
+- **`max` calibration** — empirically gives a higher PTQ baseline for
+  single-head models (yolo11s PTQ: 0.4614 with max vs 0.4603 with entropy).
+- **`yolo11-supervised` was tried first** (UBON-inspired) and *collapsed*
+  yolo11s mAP at lr=1e-4: epoch 2 dropped to mAP50-95=0.3807. Kept as an
+  option for cases where the PTQ-FP32 gap is large enough to justify
+  supervised-only training, but `yolo11-distill` is recommended.
+
 ---
 
 ## Future Roadmap

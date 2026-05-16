@@ -20,7 +20,31 @@
 
 set -e
 
-TRTEXEC="${TRTEXEC:-trtexec}"
+# Resolve trtexec: prefer $TRTEXEC -> $PATH -> the locally installed TensorRT release.
+TRTEXEC="${TRTEXEC:-}"
+if [ -z "$TRTEXEC" ]; then
+    if command -v trtexec >/dev/null 2>&1; then
+        TRTEXEC="trtexec"
+    else
+        for cand in \
+            /home/oli/dependencies/TensorRT-*/targets/x86_64-linux-gnu/bin/trtexec \
+            /opt/nvidia/tensorrt*/bin/trtexec \
+            /usr/local/cuda*/bin/trtexec
+        do
+            if [ -x "$cand" ]; then
+                TRTEXEC="$cand"
+                lib_dir="$(dirname "$(dirname "$cand")")/lib"
+                if [ -d "$lib_dir" ]; then
+                    export LD_LIBRARY_PATH="$lib_dir:${LD_LIBRARY_PATH:-}"
+                fi
+                break
+            fi
+        done
+    fi
+fi
+if [ -z "$TRTEXEC" ]; then
+    TRTEXEC="trtexec"  # will fail the next check with a clear error
+fi
 IMGSZ="${IMGSZ:-640}"
 BATCH="${BATCH:-1}"
 ITERATIONS="${ITERATIONS:-200}"

@@ -8,6 +8,8 @@ opencv-python
 pycocotools
 pulp
 huggingface_hub
+onnxconverter_common  # required by modelopt.torch._deploy.utils.torch_onnx (QAT ONNX export)
+onnx-graphsurgeon     # required by modelopt.torch._deploy (QAT ONNX export)
 
 # Install the NVIDIA model optimizer directly (nvidia-pyindex has build issues)
 # Use: pip install --no-build-isolation --extra-index-url https://pypi.ngc.nvidia.com 'nvidia-modelopt[torch]'
