@@ -1,5 +1,6 @@
 #!/bin/bash
-# Run NVIDIA ModelOpt on Ultralytics YOLO over COCO val/test.
+# Run NVIDIA ModelOpt on Ultralytics YOLO over COCO val/test or a custom
+# Ultralytics dataset YAML passed with --data.
 #
 # Default mode is QAT (quantization-aware training), matching NVIDIA's
 # examples/cnn_qat workflow: PTQ calibration -> mtq.quantize -> QAT
@@ -8,6 +9,7 @@
 # Usage:
 #   ./scripts/run_modelopt_yolo.sh                             # QAT, yolo11x + yolo26x
 #   ./scripts/run_modelopt_yolo.sh --qat-epochs 3 --batch 32
+#   ./scripts/run_modelopt_yolo.sh --data configs/my_dataset.yaml --calib-source train
 #   ./scripts/run_modelopt_yolo.sh ptq --quant-modes int8 fp8  # ONNX-only PTQ variant
 #
 # Any remaining args are forwarded to the underlying Python script.
@@ -29,7 +31,14 @@ if [ -d "venv" ] && [ -z "${VIRTUAL_ENV:-}" ]; then
     source venv/bin/activate
 fi
 
-if [ ! -d "datasets/coco/val2017" ]; then
+HAS_CUSTOM_DATA=0
+for arg in "$@"; do
+    case "$arg" in
+        --data|--data=*) HAS_CUSTOM_DATA=1 ;;
+    esac
+done
+
+if [ "$HAS_CUSTOM_DATA" -eq 0 ] && [ ! -d "datasets/coco/val2017" ]; then
     echo "⚠️  COCO val2017 not found. Downloading now (requires ~25GB)..."
     ./scripts/download_coco_dataset.sh
 fi

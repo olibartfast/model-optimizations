@@ -6,13 +6,13 @@ Workflow
 --------
 1. Load an Ultralytics YOLO checkpoint (e.g. ``yolo11x.pt``, ``yolo26x.pt``).
 2. Export the model to FP32 ONNX via Ultralytics.
-3. Build a calibration dataset from the COCO 2017 val split
-   (``datasets/coco/images/val2017``) using the same preprocessing as Ultralytics.
+3. Build a calibration dataset from the Ultralytics dataset YAML (COCO
+   ``val2017`` by default) using the same preprocessing as Ultralytics.
 4. Run NVIDIA ``modelopt.onnx.quantization`` post-training quantization
    (INT8 / FP8 / INT4) with the calibration data.
-5. Validate the quantized ONNX model on COCO val with Ultralytics
-   (``model.val(data='coco.yaml')``) to get mAP50 / mAP50-95.
-6. Optionally run inference on a sample of COCO test2017 images and save
+5. Validate the quantized ONNX model with Ultralytics
+   (``model.val(data=<dataset.yaml>)``) to get mAP50 / mAP50-95.
+6. Optionally run inference on a sample image source and save
    visualisations.
 
 Usage
@@ -38,7 +38,7 @@ import sys
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 import torch
@@ -53,6 +53,7 @@ import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 COCO_YAML = PROJECT_ROOT / "configs" / "coco.yaml"
+DEFAULT_DATA_YAML = COCO_YAML
 COCO_ROOT = PROJECT_ROOT / "datasets" / "coco"
 VAL_DIR = COCO_ROOT / "images" / "val2017"
 TEST_DIR = COCO_ROOT / "images" / "test2017"
@@ -61,6 +62,89 @@ OUT_ROOT = PROJECT_ROOT / "runs" / "modelopt"
 DEFAULT_MODELS = ("yolo11x", "yolo26x")
 DEFAULT_MODES = ("int8",)
 SUPPORTED_MODES = ("int8", "fp8", "int4")
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def _load_dataset_yaml(data_yaml: Path) -> dict[str, Any]:
+    import yaml
+
+    if not data_yaml.exists():
+        raise FileNotFoundError(f"Dataset YAML not found: {data_yaml}")
+    data = yaml.safe_load(data_yaml.read_text()) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Dataset YAML must contain a mapping: {data_yaml}")
+    return data
+
+
+def _resolve_existing_path(path: Path, data_yaml: Path) -> Path:
+    if path.is_absolute():
+        return path
+    candidates = [
+        (Path.cwd() / path),
+        (PROJECT_ROOT / path),
+        (data_yaml.parent / path),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve()
+
+
+def _first_split_value(value: Any, split: str) -> str:
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError(f"Dataset split {split!r} is empty")
+        value = value[0]
+    if value is None:
+        raise KeyError(f"Dataset YAML has no {split!r} split")
+    return str(value)
+
+
+def resolve_dataset_split(data_yaml: Path, split: str) -> Path:
+    cfg = _load_dataset_yaml(data_yaml)
+    root_value = cfg.get("path", "")
+    root = _resolve_existing_path(Path(str(root_value)).expanduser(), data_yaml) if root_value else data_yaml.parent
+    split_value = Path(_first_split_value(cfg.get(split), split)).expanduser()
+    if split_value.is_absolute():
+        return split_value
+    candidates = [root / split_value, PROJECT_ROOT / split_value, data_yaml.parent / split_value]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve()
+
+
+def resolve_calib_source(source: str, data_yaml: Path) -> Path:
+    if source in ("train", "val"):
+        return resolve_dataset_split(data_yaml, source)
+    if source in ("val2017", "train2017") and data_yaml.resolve() == DEFAULT_DATA_YAML.resolve():
+        return VAL_DIR if source == "val2017" else COCO_ROOT / "images" / "train2017"
+    candidate = Path(source).expanduser()
+    if candidate.is_absolute() or candidate.exists() or any(sep in source for sep in ("/", "\\")):
+        return _resolve_existing_path(candidate, data_yaml)
+    if source.endswith("2017") and data_yaml.resolve() != DEFAULT_DATA_YAML.resolve():
+        split = "train" if source.startswith("train") else "val" if source.startswith("val") else None
+        if split:
+            return resolve_dataset_split(data_yaml, split)
+    raise ValueError("Unknown --calib-source {!r}; expected train, val, val2017, train2017, or a path".format(source))
+
+
+def _image_paths_from_source(source: Path) -> list[Path]:
+    if not source.exists():
+        raise FileNotFoundError(f"Image source not found: {source}")
+    if source.is_dir():
+        return sorted(p for p in source.rglob("*") if p.suffix.lower() in IMAGE_SUFFIXES)
+    paths: list[Path] = []
+    for raw in source.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        p = Path(line).expanduser()
+        if not p.is_absolute():
+            candidates = [source.parent / p, PROJECT_ROOT / p, Path.cwd() / p]
+            p = next((c for c in candidates if c.exists()), candidates[0])
+        paths.append(p.resolve())
+    return [p for p in paths if p.suffix.lower() in IMAGE_SUFFIXES]
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +174,7 @@ def _letterbox(img: np.ndarray, new_shape: int = 640, color: int = 114) -> np.nd
 
 
 def build_calibration_array(
-    image_dir: Path,
+    image_source: Path,
     num_samples: int,
     imgsz: int,
     cache_path: Path,
@@ -106,15 +190,9 @@ def build_calibration_array(
         print(f"  [calib] loading cached calibration tensor: {cache_path}")
         return np.load(cache_path)
 
-    if not image_dir.exists():
-        raise FileNotFoundError(
-            f"Calibration image dir not found: {image_dir}. "
-            f"Run ./scripts/download_coco_dataset.sh first."
-        )
-
-    paths = sorted(image_dir.glob("*.jpg"))
+    paths = _image_paths_from_source(image_source)
     if not paths:
-        raise RuntimeError(f"No .jpg files in {image_dir}")
+        raise RuntimeError(f"No calibration images found in {image_source}")
 
     rng = random.Random(seed)
     rng.shuffle(paths)
@@ -228,6 +306,7 @@ class EvalResult:
 
 def evaluate_on_coco_val(
     onnx_path: Path,
+    data_yaml: Path,
     imgsz: int,
     batch: int,
     device: str,
@@ -238,7 +317,7 @@ def evaluate_on_coco_val(
     model = YOLO(str(onnx_path), task="detect")
     t0 = time.time()
     results = model.val(
-        data=str(COCO_YAML),
+        data=str(data_yaml),
         imgsz=imgsz,
         batch=batch,
         conf=0.001,
@@ -252,6 +331,7 @@ def evaluate_on_coco_val(
 
 def run_inference_samples(
     onnx_path: Path,
+    image_source: Path,
     num_samples: int,
     imgsz: int,
     device: str,
@@ -260,13 +340,13 @@ def run_inference_samples(
     """Run inference on ``num_samples`` random COCO test2017 images, save vis."""
     from ultralytics import YOLO
 
-    if not TEST_DIR.exists():
-        print(f"  [test] {TEST_DIR} not found; skipping test2017 inference.")
+    if not image_source.exists():
+        print(f"  [test] {image_source} not found; skipping inference samples.")
         return []
 
-    test_images = sorted(TEST_DIR.glob("*.jpg"))
+    test_images = _image_paths_from_source(image_source)
     if not test_images:
-        print(f"  [test] no jpgs in {TEST_DIR}; skipping")
+        print(f"  [test] no images in {image_source}; skipping")
         return []
 
     rng = random.Random(0)
@@ -311,10 +391,13 @@ def _size_mb(path: Path) -> float:
 def process_model(
     model_name: str,
     quant_modes: Iterable[str],
+    data_yaml: Path,
+    calib_source: Path,
     imgsz: int,
     calib_size: int,
     val_batch: int,
     test_samples: int,
+    test_source: Path,
     device: str,
     skip_val: bool,
 ) -> list[EvalResult]:
@@ -326,8 +409,9 @@ def process_model(
     fp32_onnx = export_fp32_onnx(model_name, imgsz, model_dir)
 
     # 2. Calibration tensor (shared across quant modes; imgsz-specific cache)
-    calib_cache = OUT_ROOT / f"calib_val2017_n{calib_size}_imgsz{imgsz}.npy"
-    calib_array = build_calibration_array(VAL_DIR, calib_size, imgsz, calib_cache)
+    safe_source = "".join(c if c.isalnum() else "_" for c in str(calib_source))[-80:]
+    calib_cache = OUT_ROOT / f"calib_{safe_source}_n{calib_size}_imgsz{imgsz}.npy"
+    calib_array = build_calibration_array(calib_source, calib_size, imgsz, calib_cache)
 
     results: list[EvalResult] = []
 
@@ -340,7 +424,7 @@ def process_model(
     )
     if not skip_val:
         try:
-            map50, mAP, secs = evaluate_on_coco_val(fp32_onnx, imgsz, val_batch, device)
+            map50, mAP, secs = evaluate_on_coco_val(fp32_onnx, data_yaml, imgsz, val_batch, device)
             fp32_result.map50 = map50
             fp32_result.map = mAP
             fp32_result.val_seconds = secs
@@ -354,7 +438,7 @@ def process_model(
 
     if test_samples > 0:
         fp32_result.test_samples = run_inference_samples(
-            fp32_onnx, test_samples, imgsz, device, model_dir / "test_fp32"
+            fp32_onnx, test_source, test_samples, imgsz, device, model_dir / "test_fp32"
         )
     results.append(fp32_result)
 
@@ -368,7 +452,7 @@ def process_model(
             quantize_onnx(fp32_onnx, mode, calib_array, q_out)
             result.size_mb = _size_mb(q_out)
             if not skip_val:
-                map50, mAP, secs = evaluate_on_coco_val(q_out, imgsz, val_batch, device)
+                map50, mAP, secs = evaluate_on_coco_val(q_out, data_yaml, imgsz, val_batch, device)
                 result.map50 = map50
                 result.map = mAP
                 result.val_seconds = secs
@@ -378,7 +462,7 @@ def process_model(
                 )
             if test_samples > 0:
                 result.test_samples = run_inference_samples(
-                    q_out, test_samples, imgsz, device, model_dir / f"test_{mode}"
+                    q_out, test_source, test_samples, imgsz, device, model_dir / f"test_{mode}"
                 )
         except Exception as e:
             result.error = str(e)
@@ -421,6 +505,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=list(DEFAULT_MODELS),
         help=f"Ultralytics model stems (default: {' '.join(DEFAULT_MODELS)})",
     )
+    p.add_argument("--data", type=Path, default=DEFAULT_DATA_YAML, help="Ultralytics dataset YAML for validation")
     p.add_argument(
         "--quant-modes",
         nargs="+",
@@ -433,7 +518,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--calib-size",
         type=int,
         default=256,
-        help="Number of COCO val2017 images used for PTQ calibration",
+        help="Number of images used for PTQ calibration",
+    )
+    p.add_argument(
+        "--calib-source",
+        default="val2017",
+        help="PTQ calibration source: train, val, val2017, train2017, or an explicit image directory/list path",
     )
     p.add_argument("--val-batch", type=int, default=8, help="Batch size for val()")
     p.add_argument(
@@ -441,6 +531,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="If > 0, run inference on this many random test2017 images and save vis.",
+    )
+    p.add_argument(
+        "--test-source",
+        type=Path,
+        default=TEST_DIR,
+        help="Image directory/list used by --test-samples",
     )
     p.add_argument(
         "--device",
@@ -459,15 +555,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-    if not COCO_YAML.exists():
-        print(f"ERROR: COCO config not found: {COCO_YAML}", file=sys.stderr)
+    data_yaml = args.data
+    if not data_yaml.exists():
+        print(f"ERROR: dataset config not found: {data_yaml}", file=sys.stderr)
         return 2
-    if not VAL_DIR.exists():
-        print(
-            f"ERROR: {VAL_DIR} not found. Run ./scripts/download_coco_dataset.sh first.",
-            file=sys.stderr,
-        )
+    try:
+        calib_source = resolve_calib_source(args.calib_source, data_yaml)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    if not calib_source.exists():
+        print(f"ERROR: calibration source not found: {calib_source}", file=sys.stderr)
+        return 2
+    test_source = _resolve_existing_path(args.test_source.expanduser(), data_yaml)
 
     all_results: list[EvalResult] = []
     for model_name in args.models:
@@ -476,10 +576,13 @@ def main(argv: list[str] | None = None) -> int:
                 process_model(
                     model_name=model_name,
                     quant_modes=args.quant_modes,
+                    data_yaml=data_yaml,
+                    calib_source=calib_source,
                     imgsz=args.imgsz,
                     calib_size=args.calib_size,
                     val_batch=args.val_batch,
                     test_samples=args.test_samples,
+                    test_source=test_source,
                     device=args.device,
                     skip_val=args.skip_val,
                 )

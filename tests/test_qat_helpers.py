@@ -233,6 +233,41 @@ def test_pin_seed_returns_none_for_none():
     assert module._pin_seed(None) is None
 
 
+def test_resolve_dataset_split_uses_yaml_path_and_split(tmp_path):
+    module = _load_qat_module()
+    root = tmp_path / "dataset"
+    val_dir = root / "images" / "val"
+    val_dir.mkdir(parents=True)
+    data_yaml = tmp_path / "custom.yaml"
+    data_yaml.write_text(
+        "path: dataset\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        "names: {0: object}\n"
+    )
+
+    assert module.resolve_dataset_split(data_yaml, "val") == val_dir.resolve()
+
+
+def test_resolve_calib_source_accepts_split_alias_and_explicit_path(tmp_path):
+    module = _load_qat_module()
+    root = tmp_path / "dataset"
+    train_dir = root / "images" / "train"
+    custom_dir = tmp_path / "calib"
+    train_dir.mkdir(parents=True)
+    custom_dir.mkdir()
+    data_yaml = tmp_path / "custom.yaml"
+    data_yaml.write_text(
+        "path: dataset\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        "names: {0: object}\n"
+    )
+
+    assert module.resolve_calib_source("train", data_yaml) == train_dir.resolve()
+    assert module.resolve_calib_source(str(custom_dir), data_yaml) == custom_dir.resolve()
+
+
 def test_snapshot_and_drift_track_amax_changes():
     module = _load_qat_module()
 

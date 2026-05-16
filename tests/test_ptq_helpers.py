@@ -41,3 +41,34 @@ def test_parse_args_accepts_multiple_quant_modes():
 
     assert args.quant_modes == ["int8", "fp8"]
     assert args.imgsz == 320
+
+
+def test_resolve_dataset_split_for_custom_yaml(tmp_path):
+    module = _load_ptq_module()
+    root = tmp_path / "dataset"
+    val_dir = root / "images" / "val"
+    val_dir.mkdir(parents=True)
+    data_yaml = tmp_path / "custom.yaml"
+    data_yaml.write_text(
+        "path: dataset\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        "names: {0: object}\n"
+    )
+
+    assert module.resolve_dataset_split(data_yaml, "val") == val_dir.resolve()
+
+
+def test_resolve_calib_source_accepts_custom_path(tmp_path):
+    module = _load_ptq_module()
+    data_yaml = tmp_path / "custom.yaml"
+    calib_dir = tmp_path / "calib"
+    calib_dir.mkdir()
+    data_yaml.write_text(
+        "path: dataset\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        "names: {0: object}\n"
+    )
+
+    assert module.resolve_calib_source(str(calib_dir), data_yaml) == calib_dir.resolve()

@@ -8,7 +8,8 @@ This file provides guidance to coding agents (Claude Code, etc.) when working wi
 
 Research scripts for **INT8 / FP8 / INT4 quantization of Ultralytics YOLO**
 detectors (YOLO11x, YOLO26x, YOLO26s, etc.) via **NVIDIA ModelOpt**, evaluated
-against **COCO `val2017`**. Two pipelines:
+against **COCO `val2017`** by default. The canonical pipelines also accept
+custom Ultralytics detection dataset YAMLs via `--data`. Two pipelines:
 
 - **PTQ** (post-training, ONNX-based) — `yolo_quantization/ptq/nvidia_modelopt_yolo.py`
 - **QAT** (post-training calibration + fine-tune, torch-based) — `yolo_quantization/qat/nvidia_modelopt_yolo_qat.py`
@@ -49,6 +50,20 @@ The current workspace already has the full `train2017` and `val2017` image
 layout in place; see `yolo_quantization/qat/README.md` for the active QAT
 data budget.
 
+Custom datasets use the normal Ultralytics detection YAML format:
+
+```yaml
+path: /path/to/dataset
+train: images/train
+val: images/val
+names:
+  0: class_name
+```
+
+Both canonical entry points accept `--data <dataset.yaml>`. `--calib-source`
+accepts `train`, `val`, legacy COCO aliases `train2017`/`val2017`, or a direct
+path to an image directory or newline-delimited image list.
+
 ## Common commands
 
 Run from repo root.
@@ -73,9 +88,9 @@ uses `max` calibration; without those, single-head QAT regresses below PTQ.
 See `yolo_quantization/qat/README.md` for the full recipe table.
 
 `--qat-log-every N` emits a `[qat/distill] step k/B` heartbeat every N batches.
-`--qat-eval-every N` runs a COCO val pass every N epochs (and on the final one),
-saving `*_qat_best.pth` whenever mAP50-95 improves. `--seed N` pins the RNGs for
-reproducibility. Per-epoch training metrics — `lr, sup, sup_box, sup_cls,
+`--qat-eval-every N` runs an Ultralytics validation pass every N epochs (and on
+the final one), saving `*_qat_best.pth` whenever mAP50-95 improves. `--seed N`
+pins the RNGs for reproducibility. Per-epoch training metrics — `lr, sup, sup_box, sup_cls,
 sup_dfl, mse, secs, amax_rel_drift, map50, map` — are persisted to
 `runs/modelopt_qat/<model>/qat_train.csv` and mirrored under
 `summary.json['qat_train']`.
@@ -108,6 +123,19 @@ avoid the calibration/eval leak:
 ```bash
 quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s --calib-source train2017 --calib-size 260
+```
+
+**Custom dataset** — train/evaluate with a non-COCO Ultralytics dataset YAML:
+```bash
+quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+  --models yolo26s --data configs/my_dataset.yaml --calib-source train
+```
+
+**Custom dataset PTQ-only ONNX**:
+```bash
+quantization_venv/bin/python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
+  --models yolo11x --data configs/my_dataset.yaml --calib-source train \
+  --quant-modes int8
 ```
 
 **Experiment driver** (`scripts/run_qat_experiments.sh`) runs the recipe across
