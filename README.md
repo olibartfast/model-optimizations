@@ -2,35 +2,49 @@
 
 This repository contains scripts and tools for optimizing deep learning models, currently with a focus on YOLO object detection models.
 
-## YOLO26 quantization
+## YOLO INT8 QAT
 
-INT8 quantization of Ultralytics YOLO26 detectors via NVIDIA ModelOpt:
-PTQ histogram calibration on COCO images, followed by QAT fine-tuning that
-combines a co-aligned `one2one`-head teacher–student distillation with the
-COCO supervised detection loss. Current full-source experiment log and
-resume commands: [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
-Future INT4 QAT exploration is tracked as roadmap work in the same QAT README.
+INT8 quantization-aware training of Ultralytics YOLO detectors via NVIDIA
+ModelOpt. Two recipes ship in
+[`yolo_quantization/qat/nvidia_modelopt_yolo_qat.py`](yolo_quantization/qat/nvidia_modelopt_yolo_qat.py),
+auto-selected per model family by `--qat-recipe auto`:
+
+- **`yolo26-distill`** — for E2E dual-head models (yolo26*). PTQ histogram
+  calibration on COCO images, then QAT fine-tune with a co-aligned `one2one`
+  teacher–student distillation combined with the COCO supervised detection
+  loss. Low/high/low LR ladder at `1e-5`.
+- **`yolo11-distill`** — for single-head models (YOLOv8 / YOLO11 / YOLO12 …).
+  Same distill+supervised loss schedule, plus UBON-derived PTQ exclusions —
+  DFL weights/inputs/outputs kept FP, Detect-head output quantizers disabled,
+  `max` calibration. Critical for single-head models because their PTQ is
+  already near-lossless and the distillation alone over-fits.
+
+Full experiment log, resume commands, and the goal-tracking diary live in
+[`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
 
 ### Results — INT8 PTQ + QAT on COCO `val2017`
 
-Pipeline: NVIDIA ModelOpt PTQ calibration on 260 images, then QAT fine-tune
-from the full COCO `train2017` source pool with 20,000 train presentations
-(10 epochs x 200 batches x batch 10). Validated with `conf=0.001, iou=0.6,
-imgsz=640` on RTX 3060 Laptop GPU.
+Validated with `conf=0.001, iou=0.6, imgsz=640` on RTX 3060 Laptop GPU.
 
-| Model | Stage | mAP50 | mAP50-95 | Δ mAP50-95 vs FP32 |
-|---|---|---:|---:|---:|
-| **yolo26s** | FP32 | 0.6384 | 0.4718 | baseline |
-|             | PTQ INT8 | 0.6368 | 0.4706 | -0.0012 (≈0.25%) |
-|             | **QAT INT8** | **0.6370** | **0.4701** | **-0.0017 (≈0.36%)** |
-| yolo26n | — | — | — | TBD |
-| yolo26m | — | — | — | TBD |
-| yolo26l | — | — | — | TBD |
-| yolo26x | — | — | — | TBD |
-| yolo11x | — | — | — | TBD |
+| Model | Recipe | Stage | mAP50 | mAP50-95 | Δ mAP50-95 vs FP32 |
+|---|---|---|---:|---:|---:|
+| **yolo26s** | `yolo26-distill` | FP32 | 0.6384 | 0.4718 | baseline |
+|             |                  | PTQ INT8 | 0.6368 | 0.4706 | -0.0012 (≈0.25%) |
+|             |                  | **QAT INT8** | **0.6370** | **0.4701** | **-0.0017 (≈0.36%)** |
+| **yolo11s** | `yolo11-distill` | FP32 | 0.6376 | 0.4622 | baseline |
+|             |                  | PTQ INT8 | 0.6370 | 0.4614 | -0.0008 (≈0.17%) |
+|             |                  | **QAT INT8** (best @ ep 2) | **0.6358** | **0.4602** | **-0.0020 (≈0.43%)** |
 
-QAT remains within statistical noise of PTQ on the 5000-image validation set
-(Δ = -0.0005 mAP50-95).
+### TensorRT inference speedup — yolo11s, batch=1, imgsz=640, RTX 3060 Laptop
+
+| Engine | Mean latency | Throughput |
+|---|---:|---:|
+| FP32 | 6.04 ms | 165.5 qps |
+| **INT8 (QAT)** | **2.48 ms** | **403.5 qps** |
+| **Speedup** | **2.44×** | **2.44×** |
+
+Measured via `scripts/measure_speedup.sh yolo11s` (trtexec 10.13.3,
+`--noTF32` for the FP32 baseline so the comparison is strict FP32 vs INT8).
 
 ## Project Structure
 
