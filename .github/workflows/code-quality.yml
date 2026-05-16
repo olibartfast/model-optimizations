@@ -1,0 +1,49 @@
+name: Code quality
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    name: Ruff and pycheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install quality tools
+        run: python -m pip install --upgrade pip ruff
+
+      - name: Ruff lint
+        run: |
+          ruff check \
+            yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+            yolo_quantization/ptq/nvidia_modelopt_yolo.py \
+            tests
+
+      - name: Pycheck syntax compile
+        run: |
+          python -m compileall -q \
+            yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+            yolo_quantization/ptq/nvidia_modelopt_yolo.py \
+            tests
+
+      - name: Shell syntax check
+        run: |
+          bash -n scripts/run_venv.sh
+          bash -n scripts/run_modelopt_yolo.sh
+          bash -n scripts/run_qat_experiments.sh
+          bash -n scripts/cloud_bootstrap.sh
+          bash -n scripts/measure_accuracy.sh
+          bash -n scripts/measure_speedup.sh
+          bash -n scripts/bench_trt.sh
+          bash -n scripts/download_coco_dataset.sh
+          bash -n yolo_quantization/scripts/run_modelopt_yolo.sh
+          bash -n yolo_quantization/scripts/download_coco_dataset.sh
