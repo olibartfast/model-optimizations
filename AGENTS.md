@@ -2,7 +2,7 @@
 
 This file provides guidance to coding agents (Claude Code, etc.) when working with code in this repository.
 
-> **Read this first:** [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md) — current state of the YOLO26 INT8 QAT work, latest FP32/PTQ/QAT metrics, the open "QAT Drop Investigation", and copy-paste resume commands. Re-read it before changing the QAT pipeline or reporting new numbers, and update it when those change.
+> **Read this first:** [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md) — current state of the YOLO26 INT8 QAT work, latest FP32/PTQ/QAT metrics, and copy-paste resume commands. Re-read it before changing the QAT pipeline or reporting new numbers, and update it when those change.
 
 ## What this repo is
 
@@ -38,16 +38,16 @@ Dependency list: `configs/requirements.txt`. ModelOpt must be installed with
 
 ```
 datasets/coco/
-├── images/{train2017,val2017}/*.jpg     # val2017 = 5000; train2017 = 4000-image deterministic subsample
+├── images/{train2017,val2017}/*.jpg     # train2017 = 118287; val2017 = 5000
 ├── labels/{train2017,val2017}/*.txt
 ├── annotations/instances_val2017.json
 └── train2017.txt val2017.txt test-dev2017.txt
 ```
 
 `scripts/download_coco_dataset.sh` fetches the raw zips into `datasets/coco/`.
-The current workspace already has the Ultralytics labels layout in place; the
-train split is intentionally a 4000-image subsample (not the full 19 GB
-`train2017.zip`) — see `yolo_quantization/qat/README.md` for why.
+The current workspace already has the full `train2017` and `val2017` image
+layout in place; see `yolo_quantization/qat/README.md` for the active QAT
+data budget.
 
 ## Common commands
 
@@ -62,8 +62,8 @@ quantization_venv/bin/python -m pytest tests/test_qat_helpers.py::test_distill_e
 **Run QAT (full pipeline: FP32 eval → PTQ calibrate → QAT distill → eval → ONNX)**:
 ```bash
 quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
-  --models yolo26s --qat-epochs 2 --calib-size 512 --imgsz 640 --batch 16 \
-  --val-batch 8 --device 0
+  --models yolo26s --qat-epochs 10 --qat-batches-per-epoch 200 \
+  --calib-size 260 --imgsz 640 --batch 10 --val-batch 8 --device 0
 ```
 
 **Resume QAT from a saved PTQ checkpoint** (skips re-calibration):
@@ -71,7 +71,8 @@ quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
 quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s \
   --from-ptq runs/modelopt_qat/yolo26s/yolo26s_ptq.pth \
-  --skip-fp32-eval --qat-mode distill --qat-epochs 2
+  --skip-fp32-eval --qat-mode distill --qat-epochs 10 \
+  --qat-batches-per-epoch 200 --batch 10
 ```
 
 **Per-module PTQ sensitivity sweep** (subcommand of the same script):
@@ -146,9 +147,9 @@ student are co-aligned to `one2one` by `_coalign_distill_outputs` because the
 restored quantized student has an empty `one2many` dict (some Detect-head
 submodule is bypassed after PTQ).
 
-Empirically (yolo26s, 3 epochs × 250 batches, Adam @ 1e-5 with low/high/low
-LR ladder), this recipe lands within ~0.001 mAP50-95 of PTQ — see
-`yolo_quantization/qat/README.md` for the full recovery history.
+Empirically (yolo26s, 10 epochs x 200 batches, batch 10, Adam @ 1e-5 with
+low/high/low LR ladder), this recipe lands within ~0.001 mAP50-95 of PTQ.
+See `yolo_quantization/qat/README.md` for the current metrics.
 
 **Avoid `--qat-mode ultralytics`** — `YOLO.train()` rebuilds the model from
 yaml and reloads weights, dropping every quantizer module. The resulting
@@ -159,7 +160,7 @@ flag.
 
 `yolo_quantization/qat/README.md` tracks:
 - per-stage mAP (FP32 / PTQ / QAT) for `yolo26s`,
-- the diagnosis of why QAT currently regresses below PTQ,
+- the active full-source QAT data and training budget,
 - copy-paste resume commands tied to the on-disk checkpoint layout.
 
 **Always update that doc when changing the QAT recipe or recording new metrics.**

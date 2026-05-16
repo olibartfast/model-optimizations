@@ -7,28 +7,29 @@ This repository contains scripts and tools for optimizing deep learning models, 
 INT8 quantization of Ultralytics YOLO26 detectors via NVIDIA ModelOpt:
 PTQ histogram calibration on COCO images, followed by QAT fine-tuning that
 combines a co-aligned `one2one`-head teacher–student distillation with the
-COCO supervised detection loss. Full pipeline, recovery history, and
-root-cause investigation: [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
+COCO supervised detection loss. Current full-source experiment log and
+resume commands: [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
 
 ### Results — INT8 PTQ + QAT on COCO `val2017`
 
-Pipeline: NVIDIA ModelOpt PTQ calibration → QAT fine-tune (co-aligned `one2one`
-distillation + COCO supervised loss) → ONNX export. Validated with
-`conf=0.001, iou=0.6, imgsz=640` on RTX 3060 Laptop GPU.
+Pipeline: NVIDIA ModelOpt PTQ calibration on 260 images, then QAT fine-tune
+from the full COCO `train2017` source pool with 20,000 train presentations
+(10 epochs x 200 batches x batch 10). Validated with `conf=0.001, iou=0.6,
+imgsz=640` on RTX 3060 Laptop GPU.
 
 | Model | Stage | mAP50 | mAP50-95 | Δ mAP50-95 vs FP32 |
 |---|---|---:|---:|---:|
 | **yolo26s** | FP32 | 0.6384 | 0.4718 | baseline |
 |             | PTQ INT8 | 0.6368 | 0.4706 | -0.0012 (≈0.25%) |
-|             | **QAT INT8** | **0.6370** | **0.4697** | **-0.0021 (≈0.44%)** |
+|             | **QAT INT8** | **0.6370** | **0.4701** | **-0.0017 (≈0.36%)** |
 | yolo26n | — | — | — | TBD |
 | yolo26m | — | — | — | TBD |
 | yolo26l | — | — | — | TBD |
 | yolo26x | — | — | — | TBD |
 | yolo11x | — | — | — | TBD |
 
-QAT closes the regression vs PTQ to within statistical noise of a 5000-image
-val set (Δ = -0.0009 mAP50-95).
+QAT remains within statistical noise of PTQ on the 5000-image validation set
+(Δ = -0.0005 mAP50-95).
 
 ## Project Structure
 
@@ -40,7 +41,6 @@ val set (Δ = -0.0009 mAP50-95).
 - `configs/` - `coco.yaml` and `requirements.txt`
 - `scripts/` - Bootstrap shell scripts (`run_modelopt_yolo.sh`, `run_venv.sh`, `download_coco_dataset.sh`)
 - `docs/`
-  - `yolo26_int8_qat_paper.md` - Write-up of the YOLO26 INT8 QAT recovery recipe
   - `LINEAR_QUANTIZATION_THEORY.md` - Linear quantization theory background
   - `readme_python3.12_on_old_ubuntu_version.md` - Python 3.12 via Deadsnakes PPA
 - `datasets/` - COCO data (gitignored)
@@ -56,8 +56,8 @@ Quick examples (run from repo root):
 ```bash
 # Full YOLO26-small QAT pipeline (FP32 eval -> PTQ -> QAT -> ONNX)
 quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
-  --models yolo26s --qat-epochs 3 --calib-size 512 --imgsz 640 --batch 16 \
-  --val-batch 8 --device 0
+  --models yolo26s --qat-epochs 10 --qat-batches-per-epoch 200 \
+  --calib-size 260 --imgsz 640 --batch 10 --val-batch 8 --device 0
 
 # PTQ-only ONNX (INT8/FP8/INT4)
 quantization_venv/bin/python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
