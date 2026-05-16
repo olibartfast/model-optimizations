@@ -82,7 +82,7 @@ are within statistical noise of their FP32 ONNX baselines.
   - `LINEAR_QUANTIZATION_THEORY.md` - Linear quantization theory background
   - `readme_python3.12_on_old_ubuntu_version.md` - Python 3.12 via Deadsnakes PPA
 - `datasets/` - COCO data (gitignored)
-- `quantization_venv/` - Pre-built Python 3.12 venv with ModelOpt installed
+- `<venv-dir>/` - Repo-local Python 3.12 venv created by `scripts/run_venv.sh`
 
 ## Getting Started
 
@@ -92,17 +92,29 @@ Canonical setup and run commands live in [`AGENTS.md`](AGENTS.md) and
 Quick examples (run from repo root):
 
 ```bash
+# Create a Python 3.12 virtual environment
+python3.12 -m venv <venv-dir>
+source <venv-dir>/bin/activate
+python -m pip install --upgrade pip wheel
+python -m pip install --no-build-isolation \
+  --extra-index-url https://pypi.ngc.nvidia.com \
+  -r configs/requirements.txt
+
+# Equivalent convenience wrapper:
+export QUANTIZATION_VENV=<venv-dir>
+./scripts/run_venv.sh
+
 # Full YOLO26-small QAT pipeline (FP32 eval -> PTQ -> QAT -> ONNX)
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s --qat-epochs 10 --qat-batches-per-epoch 200 \
   --calib-size 260 --imgsz 640 --batch 10 --val-batch 8 --device 0
 
 # PTQ-only ONNX (INT8/FP8/INT4)
-quantization_venv/bin/python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
+python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
   --models yolo11x --quant-modes int8 fp8 --calib-size 256
 
 # Custom Ultralytics dataset YAML; calibration can use train, val, or an image dir/list
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s --data configs/my_dataset.yaml --calib-source train
 ```
 
@@ -134,7 +146,7 @@ Pipelines:
 
 Helper scripts (`scripts/`):
 - [`run_modelopt_yolo.sh`](scripts/run_modelopt_yolo.sh) — thin wrapper that picks `qat` or `ptq` and forwards args
-- [`run_venv.sh`](scripts/run_venv.sh) — recreate `quantization_venv/` from `configs/requirements.txt` with the NGC extra index
+- [`run_venv.sh`](scripts/run_venv.sh) — create `$QUANTIZATION_VENV` from `configs/requirements.txt` with the NGC extra index
 - [`cloud_bootstrap.sh`](scripts/cloud_bootstrap.sh) — one-shot clone + venv + COCO setup for Colab / RunPod / AWS
 - [`download_coco_dataset.sh`](scripts/download_coco_dataset.sh) — fetch + unpack COCO 2017 val/test/annotations
 - [`run_qat_experiments.sh`](scripts/run_qat_experiments.sh) — drive `matrix` / `ablation` / `seeds` experiment runs into `runs/modelopt_qat_experiments/`

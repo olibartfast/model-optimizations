@@ -18,7 +18,9 @@
 #   DRY_RUN=1 ./scripts/run_qat_experiments.sh seeds   # print commands only
 #
 # Optional environment overrides:
-#   PY              python interpreter (default quantization_venv/bin/python)
+#   PY              python interpreter
+#   QUANTIZATION_VENV=<venv-dir>
+#                   use <venv-dir>/bin/python when PY is unset
 #   QAT_EPOCHS      override epoch count (default 10)
 #   QAT_BPE         override batches per epoch (default 200)
 #   CALIB_SIZE      override calib size (default 260)
@@ -35,7 +37,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-PY="${PY:-quantization_venv/bin/python}"
+PY="${PY:-}"
+if [ -z "$PY" ] && [ -n "${QUANTIZATION_VENV:-}" ]; then
+    PY="$QUANTIZATION_VENV/bin/python"
+fi
 QAT_SCRIPT="yolo_quantization/qat/nvidia_modelopt_yolo_qat.py"
 RUNS_ROOT="runs/modelopt_qat"
 OUT_ROOT="runs/modelopt_qat_experiments"

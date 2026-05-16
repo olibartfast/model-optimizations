@@ -1,15 +1,16 @@
 #!/bin/bash
 # Bootstrap a Python 3.12 virtual environment for this repo.
 #
-# The repo's working venv is `quantization_venv/` (already installed with
-# nvidia-modelopt[torch] from the NGC index). This script recreates it from
-# scratch in the same directory, driven by configs/requirements.txt.
+# This script creates or refreshes your chosen Python 3.12 virtual environment
+# from configs/requirements.txt, using the NGC index required for
+# nvidia-modelopt[torch].
 #
 # Usage:
+#   export QUANTIZATION_VENV="<venv-dir>"
 #   ./scripts/run_venv.sh
 #
 # After completion, invoke Python through the venv directly:
-#   quantization_venv/bin/python <script>
+#   "$QUANTIZATION_VENV/bin/python" <script>
 
 set -e
 
@@ -17,7 +18,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-VENV_DIR="quantization_venv"
+: "${QUANTIZATION_VENV:?Set QUANTIZATION_VENV to your personal venv directory, e.g. export QUANTIZATION_VENV=\"<venv-dir>\"}"
+VENV_DIR="$QUANTIZATION_VENV"
 REQS="configs/requirements.txt"
 
 if [ ! -f "$REQS" ]; then

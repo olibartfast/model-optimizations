@@ -18,17 +18,33 @@ The latter is the active development surface (YOLO26 INT8 QAT).
 
 ## Environment
 
-A pre-built venv lives at `quantization_venv/` (Python 3.12). Invoke Python
-through it directly — do not rely on `source venv/bin/activate`:
+Create a Python 3.12 virtual environment before running quantization:
 
 ```bash
-quantization_venv/bin/python <script>
+python3.12 -m venv <venv-dir>
+source <venv-dir>/bin/activate
+python -m pip install --upgrade pip wheel
+python -m pip install --no-build-isolation \
+  --extra-index-url https://pypi.ngc.nvidia.com \
+  -r configs/requirements.txt
 ```
 
-`scripts/run_venv.sh` is a bootstrap that creates a separate `venv/` from
-scratch using `nvidia-modelopt` from NGC; the existing `quantization_venv/` is
-what actually has the working install (including `pulp` and `huggingface_hub`,
-both required by `modelopt.torch.export`).
+Equivalent convenience wrapper:
+
+```bash
+export QUANTIZATION_VENV=<venv-dir>
+./scripts/run_venv.sh
+```
+
+The required details are `--no-build-isolation` and NVIDIA's NGC extra index
+for `nvidia-modelopt[torch]`. The working install includes `pulp` and
+`huggingface_hub`, both required by `modelopt.torch.export`.
+
+After activation, use `python` for repo commands:
+
+```bash
+python <script>
+```
 
 Dependency list: `configs/requirements.txt`. ModelOpt must be installed with
 `--no-build-isolation --extra-index-url https://pypi.ngc.nvidia.com 'nvidia-modelopt[torch]'`.
@@ -70,13 +86,13 @@ Run from repo root.
 
 **Tests** (helper tests for the QAT/PTQ scripts; no GPU required):
 ```bash
-quantization_venv/bin/python -m pytest tests/ -q
-quantization_venv/bin/python -m pytest tests/test_qat_helpers.py::test_distill_epoch_lr_uses_low_high_low_schedule -q
+python -m pytest tests/ -q
+python -m pytest tests/test_qat_helpers.py::test_distill_epoch_lr_uses_low_high_low_schedule -q
 ```
 
 **Run QAT (full pipeline: FP32 eval → PTQ calibrate → QAT distill → eval → ONNX)**:
 ```bash
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s --qat-recipe auto \
   --qat-log-every 20 --qat-eval-every 5 --seed 0
 ```
@@ -97,7 +113,7 @@ sup_dfl, mse, secs, amax_rel_drift, map50, map` — are persisted to
 
 **Resume QAT from a saved PTQ checkpoint** (skips re-calibration):
 ```bash
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s \
   --from-ptq runs/modelopt_qat/yolo26s/yolo26s_ptq.pth \
   --skip-fp32-eval --qat-mode distill --qat-epochs 10 \
@@ -106,14 +122,14 @@ quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
 
 **Per-module PTQ sensitivity sweep** (subcommand of the same script):
 ```bash
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   sensitivity --models yolo26s --from-ptq runs/modelopt_qat/yolo26s/yolo26s_ptq.pth
 ```
 
 **Selective dequantization** — disable quantizers on specific modules
 identified by the sensitivity sweep:
 ```bash
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s --from-ptq runs/modelopt_qat/yolo26s/yolo26s_ptq.pth \
   --keep-fp32-modules model.16.m.0.m.0 model.19.m.0.m.0 --skip-fp32-eval
 ```
@@ -121,19 +137,19 @@ quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
 **Calibration source** — use a held-out train2017 slice instead of val2017 to
 avoid the calibration/eval leak:
 ```bash
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s --calib-source train2017 --calib-size 260
 ```
 
 **Custom dataset** — train/evaluate with a non-COCO Ultralytics dataset YAML:
 ```bash
-quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s --data configs/my_dataset.yaml --calib-source train
 ```
 
 **Custom dataset PTQ-only ONNX**:
 ```bash
-quantization_venv/bin/python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
+python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
   --models yolo11x --data configs/my_dataset.yaml --calib-source train \
   --quant-modes int8
 ```
@@ -164,7 +180,7 @@ bash scripts/cloud_bootstrap.sh
 
 **Run PTQ-only ONNX pipeline**:
 ```bash
-quantization_venv/bin/python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
+python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
   --models yolo11x --quant-modes int8 fp8 --calib-size 256
 ```
 
@@ -269,8 +285,9 @@ change — do not leave stale guidance behind. Specifically:
   `scripts/run_modelopt_yolo.sh` invokes the changed script, verify it still
   points at the canonical path and forwards the new flags correctly.
 - **Install / venv / dependency changes**: update `configs/requirements.txt`
-  *and* `scripts/run_venv.sh` together. The venv name in `scripts/run_venv.sh`
-  must match the venv this repo actually uses (`quantization_venv/`).
+  *and* `scripts/run_venv.sh` together. Do not hardcode a local venv name;
+  use the `QUANTIZATION_VENV=<venv-dir>` placeholder pattern in docs and
+  scripts.
 - **Dataset layout changes** (`configs/coco.yaml`, label/image directory
   shape): update `scripts/download_coco_dataset.sh` if the layout it produces
   no longer matches, and the layout block at the bottom of
