@@ -71,18 +71,20 @@ CALIB_SOURCES = {"val2017": VAL_DIR, "train2017": TRAIN_DIR}
 #
 # Each entry holds the *default overrides* a recipe applies on top of the
 # argparse defaults. Only keys the user did not explicitly pass on the CLI
-# are overwritten (see :func:`_apply_recipe`). The `auto` recipe picks one of
-# the named recipes per model: E2E YOLO26 stays on the distillation recipe
-# that earned the recorded yolo26s baseline; single-head models (YOLOv8/v11)
-# switch to the UBON-derived supervised recipe that ships DFL/output
-# exclusion and a higher LR.
+# are overwritten (see :func:`_apply_recipe`). The `auto` recipe picks one
+# per model family: E2E YOLO26 stays on the distillation recipe that earned
+# the recorded yolo26s baseline; single-head models (YOLOv8/v11/v12) switch
+# to a variant that *keeps the DFL head and Detect output quantizers in
+# floating-point* during INT8 quantization (those layers are particularly
+# noise-sensitive on single-head architectures).
 #
 # References:
-#   - UBON QAT (https://github.com/ubonpartners/ultralytics/blob/.../UBON_QAT.md):
-#     lr0=1e-4, 5 epochs, max calibration, DFL+output quantizers disabled,
-#     no distillation, augmentations off.
 #   - NVIDIA ModelOpt PyTorch quantization guide: QAT for ~10% of original
 #     training epochs; quantizer scales frozen during QAT.
+#   - ubonpartners/ultralytics UBON_QAT.md (commit 94046a6): documents the
+#     DFL + Detect-output exclusion + max calibration pattern. The underlying
+#     observation (DFL bin probabilities don't survive INT8) is independent
+#     of that fork.
 QAT_RECIPES: dict[str, dict] = {
     "yolo26-distill": {
         # Preserves the recorded yolo26s baseline exactly. Do not modify
@@ -99,8 +101,9 @@ QAT_RECIPES: dict[str, dict] = {
         "exclude_dfl_quant": False,
     },
     "yolo11-supervised": {
-        # UBON-derived: supervised-only fine-tune, max calibration, DFL/output
-        # quantizers excluded. Targets single-head v8/v11/v12-class models
+        # Supervised-only fine-tune, max calibration, DFL + Detect-output
+        # quantizers excluded. Pattern lifted from the ubonpartners
+        # UBON_QAT.md reference. Targets single-head v8/v11/v12-class models
         # where PTQ is already near-lossless and the distillation recipe
         # over-fits.
         #
@@ -122,12 +125,13 @@ QAT_RECIPES: dict[str, dict] = {
     },
     "yolo11-distill": {
         # Hybrid: keep yolo26-distill's loss schedule (both teacher MSE and
-        # COCO supervised at lr=1e-5 with low/high/low ladder), but apply the
-        # UBON-derived PTQ exclusions (DFL and Detect output quantizers
-        # disabled, `max` calibration). Targets single-head v8/v11/v12 where
-        # PTQ alone is already near-lossless: the exclusions lift PTQ by
-        # ~+0.001 mAP50-95, and the conservative distillation schedule lets
-        # QAT match-or-exceed that baseline instead of collapsing it.
+        # COCO supervised at lr=1e-5 with low/high/low ladder), but **keep
+        # DFL and Detect output quantizers in floating-point** (the same
+        # exclusions that landed for yolo11-supervised) and switch to `max`
+        # calibration. Targets single-head v8/v11/v12 where PTQ alone is
+        # already near-lossless: the exclusions lift PTQ by ~+0.001 mAP50-95,
+        # and the conservative distillation schedule lets QAT match-or-exceed
+        # that baseline instead of collapsing it.
         "qat_epochs": 10,
         "qat_batches_per_epoch": 200,
         "qat_lr": 1e-5,
@@ -365,6 +369,28 @@ def export_onnx_modelopt(model: torch.nn.Module, imgsz: int, device: str, dst: P
             if max_det is not None:
                 module.max_det = max_det
             module.xyxy = xyxy
+    # ModelOpt names the graph IO 'x' / 'out'; Ultralytics' ONNX backend binds
+    # tensors by name and expects 'images' / 'output0'. Rename so the exported
+    # ONNX drops straight into `yolo val model=<path>.onnx`.
+    _rename_onnx_io(dst, {"x": "images"}, {"out": "output0"})
+
+
+def _rename_onnx_io(onnx_path: Path, input_map: dict[str, str], output_map: dict[str, str]) -> None:
+    """Rewrite graph input/output names so the file matches Ultralytics conventions."""
+    import onnx
+
+    model = onnx.load(str(onnx_path))
+    for graph_input in model.graph.input:
+        if graph_input.name in input_map:
+            graph_input.name = input_map[graph_input.name]
+    for graph_output in model.graph.output:
+        if graph_output.name in output_map:
+            graph_output.name = output_map[graph_output.name]
+    rename = {**input_map, **output_map}
+    for node in model.graph.node:
+        node.input[:] = [rename.get(n, n) for n in node.input]
+        node.output[:] = [rename.get(n, n) for n in node.output]
+    onnx.save(model, str(onnx_path))
 
 
 def build_quant_cfg(
@@ -898,7 +924,7 @@ def find_dfl_module_paths(model: torch.nn.Module) -> list[str]:
 
     DFL is the Distribution-Focal-Loss head used by YOLOv8 / YOLO11 / YOLO26 to
     convert distribution-over-bins outputs into continuous box-regression
-    coordinates. Per the UBON QAT recipe (and consistent with NVIDIA's
+    coordinates. Per the DFL-exclusion practice (and consistent with NVIDIA's
     sensitivity-to-quantization observations for similar heads), DFL weights
     and inputs should be excluded from INT8 quantization — quantizing the
     discrete bin probabilities causes outsized mAP regressions because tiny
