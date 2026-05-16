@@ -75,7 +75,7 @@ are within statistical noise of their FP32 ONNX baselines.
   - `ptq/nvidia_modelopt_yolo.py` - Post-Training Quantization (ONNX-based, INT8/FP8/INT4)
   - `qat/nvidia_modelopt_yolo_qat.py` - Quantization-Aware Training (torch-based, INT8)
   - `qat/README.md` - Active YOLO26 QAT log: metrics, recipe, resume commands
-- `examples/` - Non-pipeline tutorials and environment examples; QAT/PTQ entry points live only under `yolo_quantization/`
+- `examples/` - Tutorials and small environment examples
 - `configs/` - `coco.yaml` and `requirements.txt`
 - `scripts/` - Bootstrap shell scripts (`run_modelopt_yolo.sh`, `run_venv.sh`, `download_coco_dataset.sh`)
 - `docs/`
