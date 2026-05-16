@@ -111,7 +111,9 @@ the normal Ultralytics detection layout (`path`, `train`, `val`, `names`).
 `--calib-source` accepts `train`, `val`, the legacy COCO aliases
 `train2017`/`val2017`, or a direct path to an image directory or newline-delimited
 image list. The default remains COCO `configs/coco.yaml` with `val2017`
-calibration.
+calibration. See
+[`docs/CUSTOM_DATASET_QUANTIZATION.md`](docs/CUSTOM_DATASET_QUANTIZATION.md)
+for the full custom-dataset runbook.
 
 ## Requirements
 
@@ -149,6 +151,7 @@ Tests:
 - [`tests/test_ptq_helpers.py`](tests/test_ptq_helpers.py) — unit tests for PTQ helpers
 
 Documentation:
+- [`docs/CUSTOM_DATASET_QUANTIZATION.md`](docs/CUSTOM_DATASET_QUANTIZATION.md) — run QAT/PTQ quantization on a custom Ultralytics dataset
 - [`docs/LINEAR_QUANTIZATION_THEORY.md`](docs/LINEAR_QUANTIZATION_THEORY.md) — background on linear quantization math
 - [`docs/readme_python3.12_on_old_ubuntu_version.md`](docs/readme_python3.12_on_old_ubuntu_version.md) — Python 3.12 via Deadsnakes PPA
 
