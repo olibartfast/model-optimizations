@@ -60,9 +60,22 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 COCO_YAML = PROJECT_ROOT / "configs" / "coco.yaml"
 COCO_ROOT = PROJECT_ROOT / "datasets" / "coco"
 VAL_DIR = COCO_ROOT / "images" / "val2017"
+TRAIN_DIR = COCO_ROOT / "images" / "train2017"
 OUT_ROOT = PROJECT_ROOT / "runs" / "modelopt_qat"
 
 DEFAULT_MODELS = ("yolo11x", "yolo26x")
+CALIB_SOURCES = {"val2017": VAL_DIR, "train2017": TRAIN_DIR}
+
+
+def _pin_seed(seed: int | None) -> int | None:
+    if seed is None:
+        return None
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    return seed
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +498,10 @@ class ModelResult:
     stages: list[StageResult]
     onnx_path: str | None = None
     sensitivity: list[dict] | None = None
+    qat_train: list[dict] | None = None
+    best_checkpoint: str | None = None
+    best_map: float | None = None
+    config: dict | None = None
 
 
 def _calibrate_fn_factory(batches: list[torch.Tensor], device: torch.device, max_samples: int):
@@ -699,6 +716,68 @@ def _prepare_quantized_model_for_training(model: torch.nn.Module) -> tuple[int, 
     return inference_buffers, amax_states
 
 
+def _snapshot_amax_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Snapshot every quantizer's ``_amax`` buffer keyed by module path (detached, CPU)."""
+    snapshot: dict[str, torch.Tensor] = {}
+    for name, module in model.named_modules():
+        amax = module._buffers.get("_amax") if hasattr(module, "_buffers") else None
+        if torch.is_tensor(amax):
+            snapshot[name] = amax.detach().float().cpu().clone()
+    return snapshot
+
+
+def _amax_drift_stats(
+    initial: dict[str, torch.Tensor], current: dict[str, torch.Tensor]
+) -> dict[str, float]:
+    """Aggregate scale drift across the quantizer population.
+
+    ``mean_amax``: mean(|amax|) over the current snapshot.
+    ``rel_drift``: ||amax_now - amax_init||_2 / max(||amax_init||_2, eps), averaged per quantizer.
+    ``max_rel_drift``: worst single-quantizer relative drift.
+    """
+    if not current:
+        return {"count": 0, "mean_amax": 0.0, "rel_drift": 0.0, "max_rel_drift": 0.0}
+    rel_drifts: list[float] = []
+    abs_values: list[float] = []
+    for name, amax_now in current.items():
+        abs_values.append(float(amax_now.abs().mean()))
+        amax_init = initial.get(name)
+        if amax_init is None or amax_init.shape != amax_now.shape:
+            continue
+        denom = float(amax_init.norm().clamp(min=1e-12))
+        rel_drifts.append(float((amax_now - amax_init).norm()) / denom)
+    return {
+        "count": len(current),
+        "mean_amax": sum(abs_values) / max(1, len(abs_values)),
+        "rel_drift": sum(rel_drifts) / max(1, len(rel_drifts)),
+        "max_rel_drift": max(rel_drifts) if rel_drifts else 0.0,
+    }
+
+
+def disable_module_quantizers(model: torch.nn.Module, prefixes: list[str]) -> tuple[int, int]:
+    """Disable every quantizer attached to modules whose ``named_modules()`` path matches a prefix.
+
+    Returns ``(modules_matched, quantizers_disabled)``. A prefix matches the module path
+    exactly *or* matches the prefix of a dotted path (so ``"model.16"`` disables
+    ``"model.16.m.0.m.0"``'s quantizers too).
+    """
+    if not prefixes:
+        return 0, 0
+    matched_modules = 0
+    disabled = 0
+    for name, module in model.named_modules():
+        if not any(name == p or name.startswith(p + ".") for p in prefixes):
+            continue
+        module_disabled = 0
+        for quantizer in _iter_module_quantizers(module):
+            quantizer.disable()
+            module_disabled += 1
+        if module_disabled:
+            matched_modules += 1
+            disabled += module_disabled
+    return matched_modules, disabled
+
+
 def _restore_modelopt_checkpoint(mto, model: torch.nn.Module, path: Path, torch_device: torch.device) -> torch.nn.Module:
     """Restore a ModelOpt checkpoint, including local residual-add quantizer buffers."""
     objs = torch.load(path, map_location=str(torch_device), weights_only=False)
@@ -792,7 +871,10 @@ def run_distillation_qat(
     supervised_weight: float = 1.0,
     freeze_teacher_bn: bool = False,
     freeze_student_bn: bool = False,
-) -> None:
+    log_every: int = 0,
+    eval_callback=None,
+    eval_every: int = 0,
+) -> list[dict]:
     """QAT loop combining COCO supervised detection loss with teacher-student MSE.
 
     Distillation alone (MSE on raw outputs) was empirically insufficient to bring
@@ -800,6 +882,12 @@ def run_distillation_qat(
     sits below PTQ. Adding the supervised YOLO detection loss against the COCO
     labels provides the ground-truth anchor that pulls the student weights toward
     correctness, while the teacher MSE term regularizes them toward FP32 features.
+
+    Returns a per-epoch log: ``[{epoch, lr, sup, sup_box, sup_cls, sup_dfl, mse,
+    total, secs, amax_*, map50?, map?}]``. ``eval_callback(epoch_idx_1based)``,
+    if provided, is invoked every ``eval_every`` epochs *and* on the final epoch,
+    and may return ``{"map50": float, "map": float, "secs": float}`` which is
+    folded into the corresponding epoch row.
     """
     from ultralytics import YOLO
 
@@ -840,6 +928,11 @@ def run_distillation_qat(
 
     use_supervised = supervised_weight > 0.0
     use_distill = distill_weight > 0.0
+    initial_amax = _snapshot_amax_state(student_model)
+    if initial_amax:
+        print(f"  [qat] tracking amax drift across {len(initial_amax)} quantizer(s)")
+
+    training_log: list[dict] = []
 
     for epoch in range(epochs):
         student_model.train()
@@ -854,7 +947,11 @@ def run_distillation_qat(
 
         running_distill = 0.0
         running_supervised = 0.0
+        running_box = 0.0
+        running_cls = 0.0
+        running_dfl = 0.0
         seen = 0
+        epoch_t0 = time.time()
         for step, batch_data in enumerate(dataloader):
             if step >= batches_per_epoch:
                 break
@@ -871,11 +968,19 @@ def run_distillation_qat(
                     if use_distill
                     else imgs.new_zeros(())
                 )
+                step_box = step_cls = step_dfl = 0.0
                 if use_supervised:
                     sup_components, _ = _supervised_yolo_loss(student_model, student_outputs, batch_data)
                     # v8DetectionLoss.loss returns a per-component vector (box/cls/dfl);
                     # the trainer normally sums it before backward.
-                    sup_loss = sup_components.sum() if sup_components.dim() > 0 else sup_components
+                    if sup_components.dim() > 0:
+                        sup_loss = sup_components.sum()
+                        if sup_components.numel() >= 3:
+                            step_box = float(sup_components[0].detach().cpu())
+                            step_cls = float(sup_components[1].detach().cpu())
+                            step_dfl = float(sup_components[2].detach().cpu())
+                    else:
+                        sup_loss = sup_components
                 else:
                     sup_loss = imgs.new_zeros(())
                 loss = supervised_weight * sup_loss + distill_weight * distill_loss
@@ -883,17 +988,64 @@ def run_distillation_qat(
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            running_distill += float(distill_loss.detach().cpu())
-            running_supervised += float(sup_loss.detach().cpu())
+            d = float(distill_loss.detach().cpu())
+            s = float(sup_loss.detach().cpu())
+            running_distill += d
+            running_supervised += s
+            running_box += step_box
+            running_cls += step_cls
+            running_dfl += step_dfl
             seen += 1
+
+            if log_every and seen % log_every == 0:
+                print(
+                    f"  [qat/distill] epoch {epoch + 1}/{epochs} "
+                    f"step {seen}/{batches_per_epoch} lr={epoch_lr:.2e} "
+                    f"sup={s:.4f} mse={d:.4f}"
+                )
 
         denom = max(1, seen)
         avg_d = running_distill / denom
         avg_s = running_supervised / denom
+        avg_box = running_box / denom
+        avg_cls = running_cls / denom
+        avg_dfl = running_dfl / denom
+        epoch_secs = time.time() - epoch_t0
+        drift = _amax_drift_stats(initial_amax, _snapshot_amax_state(student_model))
+        total = supervised_weight * avg_s + distill_weight * avg_d
+        row: dict = {
+            "epoch": epoch + 1,
+            "lr": epoch_lr,
+            "sup": avg_s,
+            "sup_box": avg_box,
+            "sup_cls": avg_cls,
+            "sup_dfl": avg_dfl,
+            "mse": avg_d,
+            "total": total,
+            "secs": epoch_secs,
+            "amax_count": drift["count"],
+            "amax_mean": drift["mean_amax"],
+            "amax_rel_drift": drift["rel_drift"],
+            "amax_max_rel_drift": drift["max_rel_drift"],
+        }
         print(
             f"  [qat/distill] epoch {epoch + 1}/{epochs} lr={epoch_lr:.2e} "
-            f"sup={avg_s:.4f} mse={avg_d:.4f} (w_sup={supervised_weight}, w_dist={distill_weight})"
+            f"sup={avg_s:.4f}(box={avg_box:.4f} cls={avg_cls:.4f} dfl={avg_dfl:.4f}) "
+            f"mse={avg_d:.4f} secs={epoch_secs:.1f} "
+            f"amax_drift={drift['rel_drift']:.4f}"
         )
+
+        run_eval = eval_callback is not None and eval_every > 0 and (
+            (epoch + 1) % eval_every == 0 or (epoch + 1) == epochs
+        )
+        if run_eval:
+            eval_result = eval_callback(epoch + 1) or {}
+            for k in ("map50", "map", "secs"):
+                if k in eval_result:
+                    row[f"eval_{k}" if k == "secs" else k] = eval_result[k]
+
+        training_log.append(row)
+    return training_log
 
 
 def _iter_module_quantizers(module: torch.nn.Module):
@@ -991,10 +1143,13 @@ def perform_ptq_on_yolo(
     patch_residual_adds: bool,
     share_residual_add_scales: bool,
     disable_detect_output_quant: bool,
+    calib_dir: Path = VAL_DIR,
+    keep_fp32_modules: list[str] | None = None,
 ) -> tuple[StageResult, int, int, int]:
     """Run PTQ (manual max/entropy/percentile or ``mtq.quantize`` for smoothquant) and return the PTQ stage + stats."""
     ptq_stage = StageResult(stage="ptq")
-    calib_batches = build_calib_batches(VAL_DIR, imgsz, batch, calib_size)
+    print(f"  [calib] source={calib_dir.relative_to(PROJECT_ROOT) if calib_dir.is_relative_to(PROJECT_ROOT) else calib_dir}")
+    calib_batches = build_calib_batches(calib_dir, imgsz, batch, calib_size)
     calibrate = _calibrate_fn_factory(calib_batches, torch_device, calib_size)
 
     quant_cfg = build_quant_cfg(mtq, calib_method, calib_percentile)
@@ -1028,6 +1183,13 @@ def perform_ptq_on_yolo(
         print(f"  [ptq] unified scales across {unified_add_scales} residual add(s)")
     if disable_detect_output_quant:
         print(f"  [ptq] policy-disabled {disabled_detect_outputs} detect-head output quantizer(s)")
+
+    if keep_fp32_modules:
+        kept_modules, kept_quantizers = disable_module_quantizers(yolo.model, keep_fp32_modules)
+        print(
+            f"  [ptq] kept-fp32: disabled {kept_quantizers} quantizer(s) on "
+            f"{kept_modules} module(s) matching {keep_fp32_modules}"
+        )
 
     ptq_ckpt = model_dir / f"{model_name}_ptq.pth"
     cloned_inference_buffers = _clone_inference_buffers(yolo.model)
@@ -1077,6 +1239,11 @@ def run_qat_for_model(
     sensitivity: bool,
     sensitivity_stage: str,
     sensitivity_max_layers: int,
+    qat_eval_every: int = 0,
+    qat_log_every: int = 0,
+    calib_dir: Path = VAL_DIR,
+    keep_fp32_modules: list[str] | None = None,
+    seed: int | None = None,
     from_ptq: Path | None = None,
 ) -> ModelResult:
     from ultralytics import YOLO
@@ -1125,6 +1292,14 @@ def run_qat_for_model(
                     print(f"  [ptq] patched {patched_adds} residual add module(s) before restore")
             print(f"  [ptq] restoring {from_ptq}")
             yolo.model = _restore_modelopt_checkpoint(mto, yolo.model, from_ptq, torch_device)
+            if keep_fp32_modules:
+                kept_modules, kept_quantizers = disable_module_quantizers(
+                    yolo.model, keep_fp32_modules
+                )
+                print(
+                    f"  [ptq] kept-fp32: disabled {kept_quantizers} quantizer(s) on "
+                    f"{kept_modules} module(s) matching {keep_fp32_modules}"
+                )
             ptq_stage = StageResult(stage="ptq", checkpoint=str(from_ptq))
             map50, mAP, secs = eval_on_coco_val(yolo, imgsz, val_batch, device)
             ptq_stage.map50, ptq_stage.map, ptq_stage.seconds = map50, mAP, secs
@@ -1147,6 +1322,8 @@ def run_qat_for_model(
                 patch_residual_adds,
                 share_residual_add_scales,
                 disable_detect_output_quant,
+                calib_dir=calib_dir,
+                keep_fp32_modules=keep_fp32_modules,
             )
     except Exception as e:
         ptq_stage = StageResult(stage="ptq", error=str(e))
@@ -1169,10 +1346,38 @@ def run_qat_for_model(
 
     # -------- 4. QAT fine-tune via Ultralytics trainer --------
     qat_stage = StageResult(stage="qat")
+    training_log: list[dict] = []
+    best_state = {"map": None, "epoch": None, "checkpoint": None, "map50": None}
+    best_ckpt_path = model_dir / f"{model_name}_qat_best.pth"
+
+    def _qat_eval_callback(epoch_1based: int) -> dict | None:
+        try:
+            yolo.model.eval()
+            map50, mAP, secs = eval_on_coco_val(yolo, imgsz, val_batch, device)
+        except Exception as exc:  # eval is best-effort; don't kill the run
+            print(f"  [qat/eval] epoch {epoch_1based} FAILED: {exc}")
+            return None
+        finally:
+            yolo.model.train()
+        print(
+            f"  [qat/eval] epoch {epoch_1based} mAP50={map50:.4f} "
+            f"mAP50-95={mAP:.4f} ({secs:.1f}s)"
+        )
+        if best_state["map"] is None or mAP > best_state["map"]:
+            best_state.update(
+                {"map": mAP, "map50": map50, "epoch": epoch_1based, "checkpoint": str(best_ckpt_path)}
+            )
+            try:
+                mto.save(yolo.model, str(best_ckpt_path))
+                print(f"  [qat/eval] new best @ epoch {epoch_1based}: saved {best_ckpt_path}")
+            except Exception as exc:
+                print(f"  [qat/eval] WARN: best checkpoint save failed: {exc}")
+        return {"map50": map50, "map": mAP, "secs": secs}
+
     try:
         print(f"  [qat] fine-tuning for {qat_epochs} epoch(s) (mode={qat_mode}, lr0={qat_lr}, optimizer={optimizer})")
         if qat_mode == "distill":
-            run_distillation_qat(
+            training_log = run_distillation_qat(
                 student_model=yolo.model,
                 teacher_weights=weights,
                 imgsz=imgsz,
@@ -1187,6 +1392,9 @@ def run_qat_for_model(
                 supervised_weight=qat_supervised_weight,
                 freeze_teacher_bn=freeze_teacher_bn,
                 freeze_student_bn=freeze_student_bn,
+                log_every=qat_log_every,
+                eval_callback=_qat_eval_callback if qat_eval_every > 0 else None,
+                eval_every=qat_eval_every,
             )
         else:
             yolo.train(
@@ -1254,11 +1462,40 @@ def run_qat_for_model(
                 baseline_map50=qat_stage.map50,
             )
 
+    if training_log:
+        _write_qat_train_csv(model_dir / "qat_train.csv", training_log)
+
+    config_snapshot = {
+        "seed": seed,
+        "calib_source": calib_dir.name,
+        "calib_size": calib_size,
+        "calib_method": calib_method,
+        "calib_percentile": calib_percentile,
+        "qat_epochs": qat_epochs,
+        "qat_batches_per_epoch": qat_batches_per_epoch,
+        "qat_lr": qat_lr,
+        "qat_low_lr": qat_low_lr,
+        "qat_distill_weight": qat_distill_weight,
+        "qat_supervised_weight": qat_supervised_weight,
+        "qat_eval_every": qat_eval_every,
+        "qat_log_every": qat_log_every,
+        "imgsz": imgsz,
+        "batch": batch,
+        "val_batch": val_batch,
+        "disable_detect_output_quant": disable_detect_output_quant,
+        "keep_fp32_modules": keep_fp32_modules or [],
+        "freeze_teacher_bn": freeze_teacher_bn,
+        "freeze_student_bn": freeze_student_bn,
+    }
     result = ModelResult(
         model=model_name,
         stages=stages,
         onnx_path=str(onnx_path) if onnx_path else None,
         sensitivity=sensitivity_results,
+        qat_train=training_log or None,
+        best_checkpoint=best_state["checkpoint"],
+        best_map=best_state["map"],
+        config=config_snapshot,
     )
     (model_dir / "summary.json").write_text(
         json.dumps(
@@ -1267,11 +1504,36 @@ def run_qat_for_model(
                 "onnx_path": result.onnx_path,
                 "stages": [asdict(s) for s in result.stages],
                 "sensitivity": result.sensitivity,
+                "qat_train": result.qat_train,
+                "best_checkpoint": result.best_checkpoint,
+                "best_map": result.best_map,
+                "best_map50": best_state["map50"],
+                "best_epoch": best_state["epoch"],
+                "config": result.config,
             },
             indent=2,
         )
     )
     return result
+
+
+def _write_qat_train_csv(path: Path, rows: list[dict]) -> None:
+    if not rows:
+        return
+    import csv
+
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for k in row.keys():
+            if k not in seen:
+                seen.add(k)
+                fieldnames.append(k)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 # ---------------------------------------------------------------------------
@@ -1553,6 +1815,38 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=24,
         help="Maximum number of quantized modules to evaluate, sampled across model depth",
     )
+    p.add_argument(
+        "--calib-source",
+        choices=tuple(CALIB_SOURCES.keys()),
+        default="val2017",
+        help="Image source for PTQ calibration (val2017 = current default; train2017 avoids the val leak)",
+    )
+    p.add_argument(
+        "--keep-fp32-modules",
+        nargs="+",
+        default=[],
+        metavar="MODULE",
+        help="Disable quantizers on these module paths (and their submodules) right after PTQ / restore. "
+             "Useful for sensitivity-driven selective dequantization.",
+    )
+    p.add_argument(
+        "--qat-log-every",
+        type=int,
+        default=0,
+        help="Print a [qat/distill] step heartbeat every N batches within an epoch (0 = epoch summary only)",
+    )
+    p.add_argument(
+        "--qat-eval-every",
+        type=int,
+        default=0,
+        help="Run a COCO val pass every N QAT epochs (and on the final epoch); saves yolo*_qat_best.pth on improvement",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Pin Python/Numpy/Torch RNG to this seed for reproducibility",
+    )
     p.epilog = (
         "For a dedicated PTQ sensitivity subcommand, run: "
         "`python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py sensitivity --help`"
@@ -1567,9 +1861,18 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parse_qat_args(argv)
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
+    _pin_seed(args.seed)
 
     if not COCO_YAML.exists():
         print(f"ERROR: COCO config not found: {COCO_YAML}", file=sys.stderr)
+        return 2
+    calib_dir = CALIB_SOURCES[args.calib_source]
+    if not calib_dir.exists():
+        print(
+            f"ERROR: {calib_dir} not found (selected via --calib-source {args.calib_source}). "
+            f"Run ./scripts/download_coco_dataset.sh first.",
+            file=sys.stderr,
+        )
         return 2
     if not VAL_DIR.exists():
         print(
@@ -1615,6 +1918,11 @@ def main(argv: list[str] | None = None) -> int:
                     sensitivity=args.sensitivity,
                     sensitivity_stage=args.sensitivity_stage,
                     sensitivity_max_layers=args.sensitivity_max_layers,
+                    qat_eval_every=args.qat_eval_every,
+                    qat_log_every=args.qat_log_every,
+                    calib_dir=calib_dir,
+                    keep_fp32_modules=args.keep_fp32_modules or None,
+                    seed=args.seed,
                     from_ptq=args.from_ptq,
                 )
             )
@@ -1634,6 +1942,9 @@ def main(argv: list[str] | None = None) -> int:
             "onnx_path": r.onnx_path,
             "stages": [asdict(s) for s in r.stages],
             "sensitivity": r.sensitivity,
+            "best_checkpoint": r.best_checkpoint,
+            "best_map": r.best_map,
+            "config": r.config,
         }
         for r in all_results
     ]

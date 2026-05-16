@@ -212,3 +212,136 @@ def test_restore_modelopt_checkpoint_registers_extra_amax_buffers(monkeypatch, t
     restored = module._restore_modelopt_checkpoint(DummyMto, model, ckpt_path, torch.device("cpu"))
 
     assert torch.equal(restored.add_lhs_quantizer._buffers["_amax"], torch.ones(1))
+
+
+def test_pin_seed_makes_torch_rng_deterministic():
+    module = _load_qat_module()
+
+    module._pin_seed(123)
+    a = torch.rand(4)
+    module._pin_seed(123)
+    b = torch.rand(4)
+    module._pin_seed(124)
+    c = torch.rand(4)
+
+    assert torch.equal(a, b)
+    assert not torch.equal(a, c)
+
+
+def test_pin_seed_returns_none_for_none():
+    module = _load_qat_module()
+    assert module._pin_seed(None) is None
+
+
+def test_snapshot_and_drift_track_amax_changes():
+    module = _load_qat_module()
+
+    class Quantizer(torch.nn.Module):
+        def __init__(self, val):
+            super().__init__()
+            self.register_buffer("_amax", torch.tensor([val]))
+
+    model = torch.nn.Sequential(Quantizer(1.0), Quantizer(2.0), torch.nn.ReLU())
+
+    snap_a = module._snapshot_amax_state(model)
+    assert set(snap_a) == {"0", "1"}
+    # mutate one quantizer
+    model[1]._amax.fill_(4.0)
+    snap_b = module._snapshot_amax_state(model)
+    drift = module._amax_drift_stats(snap_a, snap_b)
+
+    assert drift["count"] == 2
+    # quantizer 0 unchanged, quantizer 1 doubled -> rel drift = (|4-2|/|2| + 0)/2 = 0.5
+    assert drift["rel_drift"] == pytest.approx(0.5)
+    assert drift["max_rel_drift"] == pytest.approx(1.0)
+    assert drift["mean_amax"] == pytest.approx(2.5)
+
+
+def test_amax_drift_empty_snapshot():
+    module = _load_qat_module()
+    drift = module._amax_drift_stats({}, {})
+    assert drift == {"count": 0, "mean_amax": 0.0, "rel_drift": 0.0, "max_rel_drift": 0.0}
+
+
+def test_disable_module_quantizers_matches_exact_and_descendants():
+    module = _load_qat_module()
+
+    class Quantizer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.enabled = True
+
+        def disable(self):
+            self.enabled = False
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_quantizer = Quantizer()
+            self.weight_quantizer = Quantizer()
+
+    root = torch.nn.Module()
+    root.add_module("a", Block())
+    sub = torch.nn.Module()
+    sub.add_module("inner", Block())
+    root.add_module("b", sub)
+
+    matched, disabled = module.disable_module_quantizers(root, ["a", "b.inner"])
+    assert matched == 2
+    assert disabled == 4
+    assert root.a.input_quantizer.enabled is False
+    assert root.a.weight_quantizer.enabled is False
+    assert root.b.inner.input_quantizer.enabled is False
+
+
+def test_disable_module_quantizers_prefix_match_descends():
+    module = _load_qat_module()
+
+    class Quantizer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.enabled = True
+
+        def disable(self):
+            self.enabled = False
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_quantizer = Quantizer()
+
+    root = torch.nn.Module()
+    root.add_module("model", torch.nn.Module())
+    root.model.add_module("16", torch.nn.Module())
+    root.model._modules["16"].add_module("m", Block())
+
+    matched, disabled = module.disable_module_quantizers(root, ["model.16"])
+    assert matched == 1
+    assert disabled == 1
+    assert root.model._modules["16"].m.input_quantizer.enabled is False
+
+
+def test_disable_module_quantizers_empty_prefixes_noop():
+    module = _load_qat_module()
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_quantizer = torch.nn.Module()
+
+    root = Block()
+    assert module.disable_module_quantizers(root, []) == (0, 0)
+
+
+def test_write_qat_train_csv_emits_header_and_rows(tmp_path):
+    module = _load_qat_module()
+    rows = [
+        {"epoch": 1, "lr": 1e-5, "sup": 0.5},
+        {"epoch": 2, "lr": 2e-5, "sup": 0.4, "mse": 1.2},  # widens columns
+    ]
+    out = tmp_path / "qat_train.csv"
+    module._write_qat_train_csv(out, rows)
+    lines = out.read_text().splitlines()
+    assert lines[0] == "epoch,lr,sup,mse"
+    assert lines[1] == "1,1e-05,0.5,"
+    assert lines[2] == "2,2e-05,0.4,1.2"
