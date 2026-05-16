@@ -189,19 +189,15 @@ Outputs land in `runs/modelopt_qat/<model>/` (QAT: `*_ptq.pth`, `*_qat.pth`,
 
 ## Architecture you need to know before editing
 
-### Entry-point duplication
+### Single pipeline entry points
 
-There are **two copies of each pipeline script** and they have diverged:
+There is only one supported copy of each quantization pipeline:
 
-- `yolo_quantization/{qat,ptq}/*.py` — canonical, has the latest YOLO26 fixes
-  (`--from-ptq`, dict-output handling, residual-add `_amax` restore, etc.).
-- `examples/*.py` — older copies, **lag behind**. `yolo_quantization/qat/README.md`
-  explicitly flags this; mirror fixes back here only if you intend to keep
-  them supported.
+- `yolo_quantization/qat/nvidia_modelopt_yolo_qat.py` — torch-based INT8 QAT.
+- `yolo_quantization/ptq/nvidia_modelopt_yolo.py` — ONNX-based PTQ.
 
-When making changes, prefer the `yolo_quantization/` path. `PROJECT_ROOT` in
-both scripts is derived relative to `__file__`, so the two locations cannot
-be symlinked.
+Do not add duplicate runnable copies under `examples/` or elsewhere. If a new
+workflow needs a wrapper, keep it thin and delegate to the canonical script.
 
 ### QAT pipeline shape (`nvidia_modelopt_yolo_qat.py`)
 
@@ -297,7 +293,6 @@ change — do not leave stale guidance behind. Specifically:
   references. Do **not** add new tutorial-style docs that duplicate
   information already in `README.md`, `AGENTS.md`, or
   `yolo_quantization/qat/README.md`.
-- **`examples/` lag is expected**: only mirror canonical changes back to
-  `examples/` if you intend to keep that copy supported (see entry-point
-  duplication section above). Otherwise note the lag rather than partially
-  syncing.
+- **No duplicate pipeline scripts**: keep QAT/PTQ implementation changes in
+  `yolo_quantization/{qat,ptq}/`. Wrappers may forward arguments to those
+  scripts, but should not copy their implementation.

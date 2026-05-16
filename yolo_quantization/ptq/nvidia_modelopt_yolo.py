@@ -17,7 +17,7 @@ Workflow
 
 Usage
 -----
-    python examples/nvidia_modelopt_yolo.py \
+    python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
         --models yolo11x yolo26x \
         --quant-modes int8 fp8 \
         --calib-size 256 \
