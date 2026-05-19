@@ -24,6 +24,28 @@ auto-selected per model family by `--qat-recipe auto`:
 Full experiment log, resume commands, and the goal-tracking diary live in
 [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
 
+### Experimental PyTorch AO QAT
+
+An alternative fake-quant QAT path lives in
+[`yolo_quantization/qat/pytorch_ao_yolo_qat.py`](yolo_quantization/qat/pytorch_ao_yolo_qat.py).
+It uses `torch.ao.quantization` observers and `FakeQuantize` modules wrapped
+around YOLO `Conv2d` layers, then reuses the same teacher-student +
+supervised detection fine-tune loop as the ModelOpt recipe.
+
+This path is for recipe research, not the canonical deployable INT8 pipeline
+yet: checkpoints are saved under `runs/pytorch_ao_qat/`, and ONNX export is
+best-effort because the AO fake-quant graph has not been validated as a
+TensorRT-ready Q/DQ export.
+
+```bash
+python yolo_quantization/qat/pytorch_ao_yolo_qat.py \
+  --models yolo26s --ao-recipe auto \
+  --calib-source train2017 --calib-size 260 \
+  --qat-epochs 10 --qat-batches-per-epoch 200 \
+  --batch 10 --val-batch 8 --device 0 \
+  --skip-fp32-eval --no-export
+```
+
 ### Results — INT8 PTQ + QAT on COCO `val2017`
 
 Validated with `conf=0.001, iou=0.6, imgsz=640` on RTX 3060 Laptop GPU.
@@ -74,6 +96,7 @@ are within statistical noise of their FP32 ONNX baselines.
 - `yolo_quantization/` - Canonical quantization pipelines
   - `ptq/nvidia_modelopt_yolo.py` - Post-Training Quantization (ONNX-based, INT8/FP8/INT4)
   - `qat/nvidia_modelopt_yolo_qat.py` - Quantization-Aware Training (torch-based, INT8)
+  - `qat/pytorch_ao_yolo_qat.py` - Experimental PyTorch AO fake-quant QAT recipe
   - `qat/README.md` - Active YOLO26 QAT log: metrics, recipe, resume commands
 - `examples/` - Tutorials and small environment examples
 - `configs/` - `coco.yaml` and `requirements.txt`
@@ -140,6 +163,7 @@ for the full custom-dataset runbook.
 
 Pipelines:
 - [`yolo_quantization/qat/nvidia_modelopt_yolo_qat.py`](yolo_quantization/qat/nvidia_modelopt_yolo_qat.py) — canonical QAT entry point (FP32 eval → PTQ → distill QAT → ONNX), recipe registry, sensitivity subcommand
+- [`yolo_quantization/qat/pytorch_ao_yolo_qat.py`](yolo_quantization/qat/pytorch_ao_yolo_qat.py) — experimental PyTorch AO fake-quant QAT path for comparing non-ModelOpt recipes
 - [`yolo_quantization/ptq/nvidia_modelopt_yolo.py`](yolo_quantization/ptq/nvidia_modelopt_yolo.py) — PTQ-only ONNX pipeline (INT8/FP8/INT4)
 - [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md) — active YOLO26 QAT experiment log, recipe table, design decisions
 - [`AGENTS.md`](AGENTS.md) — canonical agent guide for this repo (env, common commands, architecture notes)
