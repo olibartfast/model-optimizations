@@ -24,14 +24,19 @@ auto-selected per model family by `--qat-recipe auto`:
 Full experiment log, resume commands, and the goal-tracking diary live in
 [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
 
-Result tables below compare the **NVIDIA ModelOpt** path against the
-experimental **PyTorch AO** path. ModelOpt is the canonical deployable
-pipeline; PyTorch AO numbers are TBD pending validation of the AO fake-quant
-graph as a TensorRT-ready Q/DQ export.
+Result tables below compare two backends side-by-side:
 
-### Results — INT8 PTQ + QAT on COCO `val2017`
+- **NVIDIA ModelOpt** — canonical, deployable INT8 pipeline. All numeric
+  results in the tables below come from this path.
+- **PyTorch AO** — experimental fake-quant path
+  ([`yolo_quantization/qat/pytorch_ao_yolo_qat.py`](yolo_quantization/qat/pytorch_ao_yolo_qat.py)).
+  All AO rows are **TBD** pending validation of the AO fake-quant graph as a
+  TensorRT-ready Q/DQ export.
 
-Validated with `conf=0.001, iou=0.6, imgsz=640` on RTX 3060 Laptop GPU.
+### Results (ModelOpt vs PyTorch AO) — INT8 PTQ + QAT on COCO `val2017`
+
+ModelOpt numbers validated with `conf=0.001, iou=0.6, imgsz=640` on RTX 3060
+Laptop GPU. PyTorch AO numbers are TBD.
 
 | Model | Backend | Recipe | Stage | mAP50 | mAP50-95 | Δ mAP50-95 vs FP32 |
 |---|---|---|---|---:|---:|---:|
@@ -46,10 +51,11 @@ Validated with `conf=0.001, iou=0.6, imgsz=640` on RTX 3060 Laptop GPU.
 |             | PyTorch AO | `auto` | PTQ INT8 | TBD | TBD | TBD |
 |             | PyTorch AO |        | **QAT INT8** | TBD | TBD | TBD |
 
-### TensorRT inference speedup — batch=1, imgsz=640, RTX 3060 Laptop GPU
+### TensorRT inference speedup (ModelOpt vs PyTorch AO) — batch=1, imgsz=640, RTX 3060 Laptop GPU
 
-Measured via `scripts/measure_speedup.sh <stem>` (trtexec 10.13.3,
-`--noTF32` on the FP32 engine for a strict-FP32 baseline).
+ModelOpt numbers measured via `scripts/measure_speedup.sh <stem>` (trtexec
+10.13.3, `--noTF32` on the FP32 engine for a strict-FP32 baseline). PyTorch
+AO numbers are TBD (AO INT8 ONNX → TensorRT engine not yet validated).
 
 | Model | Backend | Engine | Mean latency | Throughput | Speedup |
 |---|---|---|---:|---:|---:|
@@ -60,12 +66,13 @@ Measured via `scripts/measure_speedup.sh <stem>` (trtexec 10.13.3,
 |             | ModelOpt   | INT8 QAT | 2.60 ms | 385.0 qps | **2.40×** |
 |             | PyTorch AO | INT8 QAT | TBD     | TBD       | TBD |
 
-### Export accuracy verification — Ultralytics val on COCO `val2017`
+### Export accuracy verification (ModelOpt vs PyTorch AO) — Ultralytics val on COCO `val2017`
 
 Q/DQ node counts only verify graph topology, not numerical correctness. To
 confirm calibrated scales and FP fallback work end-to-end, the exported ONNX
 files are validated against the PT-checkpoint baseline via Ultralytics'
-onnxruntime backend (`scripts/measure_accuracy.sh <stem>`):
+onnxruntime backend (`scripts/measure_accuracy.sh <stem>`). ModelOpt numbers
+below; PyTorch AO rows are TBD until the AO ONNX export is validated.
 
 | Model | Backend | Format | mAP50 | mAP50-95 | Δ mAP50-95 vs FP32 ONNX |
 |---|---|---|---:|---:|---:|
@@ -76,15 +83,16 @@ onnxruntime backend (`scripts/measure_accuracy.sh <stem>`):
 |             | ModelOpt   | ONNX INT8 QAT            | 0.6354 | 0.4700 | −0.0017 (≈0.4%) |
 |             | PyTorch AO | ONNX INT8 QAT            | TBD    | TBD    | TBD |
 
-The PT-vs-ONNX-FP32 delta (≈0.003 for yolo11s, ≈0.0001 for yolo26s) is
-onnxruntime postprocessing roundoff vs Ultralytics' native PyTorch path
-— independent of quantization. The ONNX-FP32-vs-ONNX-INT8 delta is the
-relevant "did INT8 quantization break the export" measurement: both models
-are within statistical noise of their FP32 ONNX baselines.
+For the ModelOpt rows, the PT-vs-ONNX-FP32 delta (≈0.003 for yolo11s,
+≈0.0001 for yolo26s) is onnxruntime postprocessing roundoff vs Ultralytics'
+native PyTorch path — independent of quantization. The ONNX-FP32-vs-ONNX-INT8
+delta is the relevant "did INT8 quantization break the export" measurement:
+both ModelOpt models are within statistical noise of their FP32 ONNX
+baselines.
 
 ### Experimental PyTorch AO QAT
 
-An alternative fake-quant QAT path lives in
+The PyTorch AO column in the tables above is populated by
 [`yolo_quantization/qat/pytorch_ao_yolo_qat.py`](yolo_quantization/qat/pytorch_ao_yolo_qat.py).
 It uses `torch.ao.quantization` observers and `FakeQuantize` modules wrapped
 around YOLO `Conv2d` layers, then reuses the same teacher-student +
@@ -93,7 +101,8 @@ supervised detection fine-tune loop as the ModelOpt recipe.
 This path is for recipe research, not the canonical deployable INT8 pipeline
 yet: checkpoints are saved under `runs/pytorch_ao_qat/`, and ONNX export is
 best-effort because the AO fake-quant graph has not been validated as a
-TensorRT-ready Q/DQ export. None of the result tables above use this path.
+TensorRT-ready Q/DQ export. All AO rows in the tables above are TBD until
+that validation lands.
 
 ```bash
 python yolo_quantization/qat/pytorch_ao_yolo_qat.py \
