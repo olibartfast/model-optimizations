@@ -162,6 +162,12 @@ hurts it.
 
 - INT4 QAT exploration: keep the production baseline on INT8 QAT until INT4 has its own smoke-tested path. Start with ModelOpt torch `INT4_AWQ_CFG` or `INT4_BLOCKWISE_WEIGHT_ONLY_CFG` as weight-only INT4 fine-tuning, then consider activation INT4 only after the weight-only path is stable.
 - Required smoke checks before any full COCO run: PTQ/restore succeeds, one-batch backward works, mAP is sane on a small validation slice, and ONNX export/deployability is verified. Do not treat activation+weight INT4 as ready or expected to work until those checks pass.
+- PyTorch AO alternative: `pytorch_ao_yolo_qat.py` is an experimental
+  fake-quant recipe path using `torch.ao.quantization` observers and
+  `FakeQuantize` around YOLO `Conv2d` layers. It is intended for YOLO11/YOLO26
+  recipe comparisons against ModelOpt, saves under `runs/pytorch_ao_qat/`, and
+  should not replace the canonical ModelOpt INT8 pipeline until export and
+  TensorRT deployability are validated.
 
 ---
 
@@ -213,6 +219,61 @@ python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --models yolo26s \
   --from-ptq runs/modelopt_qat/yolo26s/yolo26s_ptq.pth \
   --qat-mode distill \
+  --qat-epochs 10 \
+  --qat-batches-per-epoch 200 \
+  --batch 10 \
+  --val-batch 8 \
+  --workers 4 \
+  --device 0 \
+  --skip-fp32-eval \
+  --no-export
+```
+
+Run the experimental PyTorch AO fake-quant recipe:
+
+```bash
+python yolo_quantization/qat/pytorch_ao_yolo_qat.py \
+  --models yolo26s \
+  --ao-recipe auto \
+  --calib-source train2017 \
+  --calib-size 260 \
+  --qat-epochs 10 \
+  --qat-batches-per-epoch 200 \
+  --batch 10 \
+  --val-batch 8 \
+  --workers 4 \
+  --device 0 \
+  --skip-fp32-eval \
+  --no-export
+```
+
+Quick AO plumbing smoke test (calibration + one train batch, no full COCO val):
+
+```bash
+python yolo_quantization/qat/pytorch_ao_yolo_qat.py \
+  --models yolo26s \
+  --ao-recipe auto \
+  --calib-source train2017 \
+  --calib-size 2 \
+  --qat-epochs 1 \
+  --qat-batches-per-epoch 1 \
+  --batch 2 \
+  --val-batch 2 \
+  --workers 0 \
+  --device 0 \
+  --skip-fp32-eval \
+  --skip-ptq-eval \
+  --skip-qat-eval \
+  --no-export \
+  --qat-log-every 1
+```
+
+Resume the AO fine-tune from its calibrated fake-quant PTQ proxy:
+
+```bash
+python yolo_quantization/qat/pytorch_ao_yolo_qat.py \
+  --models yolo26s \
+  --from-ao-ptq runs/pytorch_ao_qat/yolo26s/yolo26s_ao_ptq.pth \
   --qat-epochs 10 \
   --qat-batches-per-epoch 200 \
   --batch 10 \
