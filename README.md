@@ -24,6 +24,64 @@ auto-selected per model family by `--qat-recipe auto`:
 Full experiment log, resume commands, and the goal-tracking diary live in
 [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
 
+Result tables below compare the **NVIDIA ModelOpt** path against the
+experimental **PyTorch AO** path. ModelOpt is the canonical deployable
+pipeline; PyTorch AO numbers are TBD pending validation of the AO fake-quant
+graph as a TensorRT-ready Q/DQ export.
+
+### Results — INT8 PTQ + QAT on COCO `val2017`
+
+Validated with `conf=0.001, iou=0.6, imgsz=640` on RTX 3060 Laptop GPU.
+
+| Model | Backend | Recipe | Stage | mAP50 | mAP50-95 | Δ mAP50-95 vs FP32 |
+|---|---|---|---|---:|---:|---:|
+| **yolo26s** | ModelOpt | `yolo26-distill` | FP32 | 0.6384 | 0.4718 | baseline |
+|             | ModelOpt |                  | PTQ INT8 | 0.6368 | 0.4706 | -0.0012 (≈0.25%) |
+|             | ModelOpt |                  | **QAT INT8** | **0.6370** | **0.4701** | **-0.0017 (≈0.36%)** |
+|             | PyTorch AO | `auto` | PTQ INT8 | TBD | TBD | TBD |
+|             | PyTorch AO |        | **QAT INT8** | TBD | TBD | TBD |
+| **yolo11s** | ModelOpt | `yolo11-distill` | FP32 | 0.6376 | 0.4622 | baseline |
+|             | ModelOpt |                  | PTQ INT8 | 0.6370 | 0.4614 | -0.0008 (≈0.17%) |
+|             | ModelOpt |                  | **QAT INT8** (best @ ep 2) | **0.6358** | **0.4602** | **-0.0020 (≈0.43%)** |
+|             | PyTorch AO | `auto` | PTQ INT8 | TBD | TBD | TBD |
+|             | PyTorch AO |        | **QAT INT8** | TBD | TBD | TBD |
+
+### TensorRT inference speedup — batch=1, imgsz=640, RTX 3060 Laptop GPU
+
+Measured via `scripts/measure_speedup.sh <stem>` (trtexec 10.13.3,
+`--noTF32` on the FP32 engine for a strict-FP32 baseline).
+
+| Model | Backend | Engine | Mean latency | Throughput | Speedup |
+|---|---|---|---:|---:|---:|
+| **yolo11s** | ModelOpt   | FP32     | 6.04 ms | 165.5 qps | 1.00× |
+|             | ModelOpt   | INT8 QAT | 2.48 ms | 403.5 qps | **2.44×** |
+|             | PyTorch AO | INT8 QAT | TBD     | TBD       | TBD |
+| **yolo26s** | ModelOpt   | FP32     | 6.24 ms | 160.3 qps | 1.00× |
+|             | ModelOpt   | INT8 QAT | 2.60 ms | 385.0 qps | **2.40×** |
+|             | PyTorch AO | INT8 QAT | TBD     | TBD       | TBD |
+
+### Export accuracy verification — Ultralytics val on COCO `val2017`
+
+Q/DQ node counts only verify graph topology, not numerical correctness. To
+confirm calibrated scales and FP fallback work end-to-end, the exported ONNX
+files are validated against the PT-checkpoint baseline via Ultralytics'
+onnxruntime backend (`scripts/measure_accuracy.sh <stem>`):
+
+| Model | Backend | Format | mAP50 | mAP50-95 | Δ mAP50-95 vs FP32 ONNX |
+|---|---|---|---:|---:|---:|
+| **yolo11s** | ModelOpt   | ONNX FP32 (ort baseline) | 0.6336 | 0.4592 | baseline |
+|             | ModelOpt   | ONNX INT8 QAT            | 0.6325 | 0.4572 | −0.0020 (≈0.4%) |
+|             | PyTorch AO | ONNX INT8 QAT            | TBD    | TBD    | TBD |
+| **yolo26s** | ModelOpt   | ONNX FP32 (ort baseline) | 0.6362 | 0.4717 | baseline |
+|             | ModelOpt   | ONNX INT8 QAT            | 0.6354 | 0.4700 | −0.0017 (≈0.4%) |
+|             | PyTorch AO | ONNX INT8 QAT            | TBD    | TBD    | TBD |
+
+The PT-vs-ONNX-FP32 delta (≈0.003 for yolo11s, ≈0.0001 for yolo26s) is
+onnxruntime postprocessing roundoff vs Ultralytics' native PyTorch path
+— independent of quantization. The ONNX-FP32-vs-ONNX-INT8 delta is the
+relevant "did INT8 quantization break the export" measurement: both models
+are within statistical noise of their FP32 ONNX baselines.
+
 ### Experimental PyTorch AO QAT
 
 An alternative fake-quant QAT path lives in
@@ -35,7 +93,7 @@ supervised detection fine-tune loop as the ModelOpt recipe.
 This path is for recipe research, not the canonical deployable INT8 pipeline
 yet: checkpoints are saved under `runs/pytorch_ao_qat/`, and ONNX export is
 best-effort because the AO fake-quant graph has not been validated as a
-TensorRT-ready Q/DQ export.
+TensorRT-ready Q/DQ export. None of the result tables above use this path.
 
 ```bash
 python yolo_quantization/qat/pytorch_ao_yolo_qat.py \
@@ -45,51 +103,6 @@ python yolo_quantization/qat/pytorch_ao_yolo_qat.py \
   --batch 10 --val-batch 8 --device 0 \
   --skip-fp32-eval --no-export
 ```
-
-### Results — INT8 PTQ + QAT on COCO `val2017`
-
-Validated with `conf=0.001, iou=0.6, imgsz=640` on RTX 3060 Laptop GPU.
-
-| Model | Recipe | Stage | mAP50 | mAP50-95 | Δ mAP50-95 vs FP32 |
-|---|---|---|---:|---:|---:|
-| **yolo26s** | `yolo26-distill` | FP32 | 0.6384 | 0.4718 | baseline |
-|             |                  | PTQ INT8 | 0.6368 | 0.4706 | -0.0012 (≈0.25%) |
-|             |                  | **QAT INT8** | **0.6370** | **0.4701** | **-0.0017 (≈0.36%)** |
-| **yolo11s** | `yolo11-distill` | FP32 | 0.6376 | 0.4622 | baseline |
-|             |                  | PTQ INT8 | 0.6370 | 0.4614 | -0.0008 (≈0.17%) |
-|             |                  | **QAT INT8** (best @ ep 2) | **0.6358** | **0.4602** | **-0.0020 (≈0.43%)** |
-
-### TensorRT inference speedup — batch=1, imgsz=640, RTX 3060 Laptop GPU
-
-Measured via `scripts/measure_speedup.sh <stem>` (trtexec 10.13.3,
-`--noTF32` on the FP32 engine for a strict-FP32 baseline).
-
-| Model | Engine | Mean latency | Throughput | Speedup |
-|---|---|---:|---:|---:|
-| **yolo11s** | FP32 | 6.04 ms | 165.5 qps | 1.00× |
-|             | INT8 QAT | 2.48 ms | 403.5 qps | **2.44×** |
-| **yolo26s** | FP32 | 6.24 ms | 160.3 qps | 1.00× |
-|             | INT8 QAT | 2.60 ms | 385.0 qps | **2.40×** |
-
-### Export accuracy verification — Ultralytics val on COCO `val2017`
-
-Q/DQ node counts only verify graph topology, not numerical correctness. To
-confirm calibrated scales and FP fallback work end-to-end, the exported ONNX
-files are validated against the PT-checkpoint baseline via Ultralytics'
-onnxruntime backend (`scripts/measure_accuracy.sh <stem>`):
-
-| Model | Format | mAP50 | mAP50-95 | Δ mAP50-95 vs FP32 ONNX |
-|---|---|---:|---:|---:|
-| **yolo11s** | ONNX FP32 (ort baseline) | 0.6336 | 0.4592 | baseline |
-|             | ONNX INT8 QAT | 0.6325 | 0.4572 | −0.0020 (≈0.4%) |
-| **yolo26s** | ONNX FP32 (ort baseline) | 0.6362 | 0.4717 | baseline |
-|             | ONNX INT8 QAT | 0.6354 | 0.4700 | −0.0017 (≈0.4%) |
-
-The PT-vs-ONNX-FP32 delta (≈0.003 for yolo11s, ≈0.0001 for yolo26s) is
-onnxruntime postprocessing roundoff vs Ultralytics' native PyTorch path
-— independent of quantization. The ONNX-FP32-vs-ONNX-INT8 delta is the
-relevant "did INT8 quantization break the export" measurement: both models
-are within statistical noise of their FP32 ONNX baselines.
 
 ## Project Structure
 
