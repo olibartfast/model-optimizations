@@ -16,8 +16,8 @@ RF-DETR using NVIDIA ModelOpt"* started 2026-05-18.
 | mAP evaluator | ✅ done | `evaluate_map` runs COCO `val2017` through the quantized model + `PostProcess` and scores via rfdetr's `CocoEvaluator` (raw COCO category ids, no remap). |
 | QAT distillation loop | ✅ done | FP32 teacher / INT8 student, **backbone feature-map distillation** (normalized MSE); Adam low/high/low ladder; per-epoch eval + best-checkpoint rollback. |
 | e2e pipeline | ✅ done | `main()` runs FP32 eval → PTQ → PTQ eval → QAT → QAT eval → ONNX, with stage skip/resume flags. |
-| ONNX export | 🟡 patched, validation pending | Export now wraps tracing with `_patch_interpolate_no_antialias()` and defaults to opset 17 so DINOv2 positional-encoding resize should avoid `aten::_upsample_bicubic2d_aa`; needs a checkpoint export run to confirm Q/DQ ONNX writes cleanly. |
-| TRT speedup measurement | 🟡 helper added | `rfdetr_trt.py` builds INT8 Q/DQ and FP16 TensorRT engines, benchmarks CUDA-event latency, and can evaluate deployed-engine COCO mAP once ONNX files exist. |
+| ONNX export | ✅ validated | `rfdetr_nano_qat.onnx` exports at opset 17 with 192 Q/DQ pairs; `rfdetr_nano_fp32.onnx` exports as the FP16 TensorRT baseline input. |
+| TRT speedup measurement | ✅ done | `rfdetr_trt.py`: INT8 Q/DQ engine 2.304 ms / 433.9 fps / mAP 0.4929; FP16 baseline 2.324 ms / 430.3 fps / mAP 0.4999; speedup 1.01x. |
 
 ---
 
@@ -113,12 +113,12 @@ Headroom for a follow-up: QAT only fine-tunes the backbone; the transformer +
 head quantizers are left at their PTQ state. Extending feature distillation to
 the transformer encoder memory (also position-aligned) is the next lever.
 
-Export/deployment status: the code now patches `F.interpolate(antialias=True)`
-to `antialias=False` during ONNX tracing and defaults RF-DETR export to opset
-17, addressing the previous DINOv2 `aten::_upsample_bicubic2d_aa` blocker. The
-next validation step is to rerun export from `rfdetr_nano_qat.pth` and then run
-`rfdetr_quantization/rfdetr_trt.py` for TensorRT latency and deployed-engine
-mAP.
+Export/deployment status: ONNX export and TensorRT benchmarking are complete.
+The QAT checkpoint exports to `rfdetr_nano_qat.onnx` with 192 Q/DQ pairs, and
+TensorRT builds a 36.0 MB INT8 engine. On RTX 3060 Laptop GPU, INT8 latency is
+2.304 ms mean / 433.9 fps with deployed-engine mAP50-95 0.4929. The FP32 ONNX
+baseline built as FP16 is 2.324 ms / 430.3 fps with mAP50-95 0.4999, so RF-DETR
+is accuracy-correct but only 1.01x faster in this configuration.
 
 ---
 
@@ -138,15 +138,14 @@ mAP.
 
 ## Open questions / next steps
 
-1. **ONNX export validation.** Rerun export from the saved QAT checkpoint and
-   confirm `runs/modelopt_qat/rfdetr_nano/rfdetr_nano_qat.onnx` contains Q/DQ
-   nodes and no `aten::_upsample_bicubic2d_aa` blocker.
-2. **TRT speedup.** Run `rfdetr_quantization/rfdetr_trt.py` on the QAT ONNX and
-   an FP32 ONNX baseline to record INT8-vs-FP16 latency plus deployed-engine
-   mAP.
-3. **Supervised QAT.** Distillation recovers most of the PTQ gap; a supervised
+1. **TensorRT profiling.** INT8 is only 1.01x faster than FP16; inspect the TRT
+   layer profile to identify whether deformable attention, transformer ops, or
+   FP32 fallback dominate runtime.
+2. **Supervised QAT.** Distillation recovers most of the PTQ gap; a supervised
    `SetCriterion` fine-tune (with Hungarian matching) is the next lever if more
    accuracy is needed — it would need COCO targets in DETR format.
+3. **Broader AO comparison.** The PyTorch AO RF-DETR script exists; run the same
+   1500-image eval and TensorRT export path once an AO ONNX export is proven.
 4. **Repo layout.** If RF-DETR support grows, rename the top-level package from
    `yolo_quantization/` to `model_quantization/` and split the workstreams.
 

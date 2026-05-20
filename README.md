@@ -69,6 +69,33 @@ onnxruntime postprocessing roundoff vs Ultralytics' native PyTorch path
 relevant "did INT8 quantization break the export" measurement: both models
 are within statistical noise of their FP32 ONNX baselines.
 
+## RF-DETR INT8 QAT
+
+RF-DETR support lives in [`rfdetr_quantization/`](rfdetr_quantization/). The ModelOpt path uses PTQ calibration plus backbone feature-map distillation QAT, keeping `class_embed` and `bbox_embed` heads FP32.
+
+### Results — RF-DETR-nano on COCO `val2017`
+
+Validated on the first 1500 COCO `val2017` images at RF-DETR-nano's native `imgsz=384`. PTQ used 256 calibration images; QAT used 6 epochs x 960 `train2017` images with best-epoch rollback.
+
+| Model | Stage | mAP50 | mAP50-95 | Delta mAP50-95 vs FP32 |
+|---|---|---:|---:|---:|
+| **rfdetr-nano** | FP32 | 0.6875 | 0.5001 | baseline |
+|                 | PTQ INT8 | 0.6779 | 0.4917 | -0.0084 |
+|                 | **QAT INT8** (best @ ep 6) | **0.6778** | **0.4925** | **-0.0076** |
+
+ONNX export is validated for this checkpoint: `rfdetr_nano_qat.onnx` exports with 192 `QuantizeLinear` and 192 `DequantizeLinear` nodes, while `rfdetr_nano_fp32.onnx` exports with no Q/DQ nodes.
+
+### TensorRT deployment — batch=1, imgsz=384, RTX 3060 Laptop GPU
+
+Measured with `rfdetr_quantization/rfdetr_trt.py` over 300 CUDA-event timing iterations. Accuracy is deployed-engine COCO mAP on the same first 1500 `val2017` images.
+
+| Engine | Mean latency | Median latency | Throughput | mAP50 | mAP50-95 | Speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| FP32 ONNX built as FP16 | 2.324 ms | 2.271 ms | 430.3 fps | 0.6871 | 0.4999 | 1.00x |
+| QAT Q/DQ ONNX built as INT8 | **2.304 ms** | 2.300 ms | **433.9 fps** | 0.6786 | 0.4929 | **1.01x** |
+
+The RF-DETR-nano TensorRT result is accuracy-correct but not materially faster than the FP16 baseline on this GPU. The exported graph still contains many non-quantized transformer/deformable-attention operations, so INT8 only improves a subset of the runtime path.
+
 ## Project Structure
 
 - `yolo_quantization/` - Canonical quantization pipelines
@@ -77,6 +104,7 @@ are within statistical noise of their FP32 ONNX baselines.
   - `qat/README.md` - Active YOLO26 QAT log: metrics, recipe, resume commands
 - `rfdetr_quantization/` - RF-DETR quantization workstream
   - `nvidia_modelopt_rfdetr_qat.py` - RF-DETR e2e INT8 pipeline: FP32 eval -> PTQ -> QAT distill -> eval -> ONNX
+  - `pytorch_ao_rfdetr_qat.py` - RF-DETR experimental PyTorch AO fake-quant PTQ/QAT pipeline
   - `rfdetr_trt.py` - TensorRT engine build, latency benchmark, and deployed-engine COCO mAP for RF-DETR ONNX exports
   - `WIP.md` - RF-DETR status, known issues, and next steps
 - `examples/` - Tutorials and small environment examples
