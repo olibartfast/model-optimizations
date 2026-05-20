@@ -16,8 +16,8 @@ RF-DETR using NVIDIA ModelOpt"* started 2026-05-18.
 | mAP evaluator | ✅ done | `evaluate_map` runs COCO `val2017` through the quantized model + `PostProcess` and scores via rfdetr's `CocoEvaluator` (raw COCO category ids, no remap). |
 | QAT distillation loop | ✅ done | FP32 teacher / INT8 student, **backbone feature-map distillation** (normalized MSE); Adam low/high/low ladder; per-epoch eval + best-checkpoint rollback. |
 | e2e pipeline | ✅ done | `main()` runs FP32 eval → PTQ → PTQ eval → QAT → QAT eval → ONNX, with stage skip/resume flags. |
-| ONNX export | ❌ blocked | Fails on `aten::_upsample_bicubic2d_aa` (DINOv2 positional-encoding resample) at opset 17 *and* 20. Needs a static-interpolation patch of the backbone resample before tracing. |
-| TRT speedup measurement | ❌ blocked on ONNX export | |
+| ONNX export | 🟡 patched, validation pending | Export now wraps tracing with `_patch_interpolate_no_antialias()` and defaults to opset 17 so DINOv2 positional-encoding resize should avoid `aten::_upsample_bicubic2d_aa`; needs a checkpoint export run to confirm Q/DQ ONNX writes cleanly. |
+| TRT speedup measurement | 🟡 helper added | `rfdetr_trt.py` builds INT8 Q/DQ and FP16 TensorRT engines, benchmarks CUDA-event latency, and can evaluate deployed-engine COCO mAP once ONNX files exist. |
 
 ---
 
@@ -64,8 +64,9 @@ point. Stages (each skippable / resumable):
 3. **PTQ eval** — mAP of the calibrated INT8 model.
 4. **QAT distill** — `run_distillation_qat` (see above).
 5. **QAT eval** — mAP of the best QAT epoch.
-6. **ONNX export** — `_RFDETRTracingWrapper` + ModelOpt deploy path (currently
-   fails, see status table).
+6. **ONNX export** — `_RFDETRTracingWrapper` + ModelOpt deploy path, with
+   `_patch_interpolate_no_antialias()` around tracing to avoid the DINOv2
+   `aten::_upsample_bicubic2d_aa` exporter blocker.
 
 Outputs land in `runs/modelopt_qat/rfdetr_nano/`: `*_ptq.pth`, `*_qat.pth`,
 `summary.json` (per-stage mAP), `qat_train.csv` (per-epoch loss + mAP).
@@ -84,7 +85,8 @@ Resume QAT from a saved PTQ checkpoint (skips calibration)::
 
 Useful flags: `--eval-limit N` (cap eval images), `--skip-qat` (PTQ-only),
 `--qat-source {train,val}` (QAT image pool; `train` avoids the eval leak),
-`--qat-lr / --qat-low-lr`, `--qat-eval-every N`, `--no-export`.
+`--qat-lr / --qat-low-lr`, `--qat-eval-every N`, `--no-export`,
+`--onnx-opset N` (default 17).
 
 ---
 
@@ -111,6 +113,13 @@ Headroom for a follow-up: QAT only fine-tunes the backbone; the transformer +
 head quantizers are left at their PTQ state. Extending feature distillation to
 the transformer encoder memory (also position-aligned) is the next lever.
 
+Export/deployment status: the code now patches `F.interpolate(antialias=True)`
+to `antialias=False` during ONNX tracing and defaults RF-DETR export to opset
+17, addressing the previous DINOv2 `aten::_upsample_bicubic2d_aa` blocker. The
+next validation step is to rerun export from `rfdetr_nano_qat.pth` and then run
+`rfdetr_quantization/rfdetr_trt.py` for TensorRT latency and deployed-engine
+mAP.
+
 ---
 
 ## Design decisions
@@ -129,10 +138,12 @@ the transformer encoder memory (also position-aligned) is the next lever.
 
 ## Open questions / next steps
 
-1. **ONNX export.** Patch the DINOv2 positional-encoding resample to a static
-   interpolation (or a non-AA `bicubic`) before tracing so the graph no longer
-   emits `aten::_upsample_bicubic2d_aa`. Blocks TRT benchmarking.
-2. **TRT speedup.** Once ONNX exports, reuse `scripts/measure_speedup.sh`.
+1. **ONNX export validation.** Rerun export from the saved QAT checkpoint and
+   confirm `runs/modelopt_qat/rfdetr_nano/rfdetr_nano_qat.onnx` contains Q/DQ
+   nodes and no `aten::_upsample_bicubic2d_aa` blocker.
+2. **TRT speedup.** Run `rfdetr_quantization/rfdetr_trt.py` on the QAT ONNX and
+   an FP32 ONNX baseline to record INT8-vs-FP16 latency plus deployed-engine
+   mAP.
 3. **Supervised QAT.** Distillation recovers most of the PTQ gap; a supervised
    `SetCriterion` fine-tune (with Hungarian matching) is the next lever if more
    accuracy is needed — it would need COCO targets in DETR format.

@@ -17,11 +17,12 @@ with a DINOv2 ViT backbone). Key differences from the YOLO recipe:
   DFL + Detect-output). Default exclusions: ``"*class_embed*"``,
   ``"*bbox_embed*"``. LayerNorm and Embedding modules are skipped
   automatically by ModelOpt's default config; no extra work needed.
-* **QAT objective.** Pure teacher/student distillation: a frozen FP32 teacher
-  and the INT8 student see the same images; the student is fine-tuned with a
-  per-tensor-normalized MSE on ``pred_logits`` + ``pred_boxes``. No COCO
-  ground-truth targets are needed, which sidesteps RF-DETR's
-  Albumentations-version-dependent target transform stack.
+* **QAT objective.** Pure teacher/student feature distillation: a frozen FP32
+  teacher and the INT8 student see the same images; the student backbone is
+  fine-tuned with a per-map-normalized MSE on spatial backbone features. No
+  COCO ground-truth targets are needed, which sidesteps RF-DETR's
+  Albumentations-version-dependent target transform stack and avoids DETR's
+  unordered final-query outputs.
 
 Full pipeline (each stage resumable / skippable):
 
@@ -36,6 +37,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import json
 import sys
@@ -454,6 +456,31 @@ class _RFDETRTracingWrapper(torch.nn.Module):
         return out["pred_logits"], out["pred_boxes"]
 
 
+@contextlib.contextmanager
+def _patch_interpolate_no_antialias():
+    """Force ``F.interpolate(antialias=False)`` for the duration of an ONNX export.
+
+    RF-DETR's DINOv2 backbone resamples positional encodings with
+    ``bicubic + antialias``, which the PyTorch ONNX exporter traces as
+    ``aten::_upsample_bicubic2d_aa`` — an op unsupported at opset <= 20.
+    Antialiasing only affects *down*-sampling; the positional-encoding resample
+    here is same-size / up-sampling, so disabling it is numerically a no-op and
+    yields the exportable ``aten::_upsample_bicubic2d`` instead.
+    """
+    orig = torch.nn.functional.interpolate
+
+    def patched(*args, **kwargs):
+        if kwargs.get("antialias"):
+            kwargs = {**kwargs, "antialias": False}
+        return orig(*args, **kwargs)
+
+    torch.nn.functional.interpolate = patched
+    try:
+        yield
+    finally:
+        torch.nn.functional.interpolate = orig
+
+
 def _modelopt_onnx_bytes(model: torch.nn.Module, dummy: torch.Tensor, *, onnx_opset: int) -> bytes:
     """Get ONNX bytes via modelopt — prefer ``mte.export_onnx`` (newer), fall back to deploy path."""
     try:
@@ -473,12 +500,18 @@ def _modelopt_onnx_bytes(model: torch.nn.Module, dummy: torch.Tensor, *, onnx_op
 
 
 def export_onnx(
-    model: torch.nn.Module, imgsz: int, device: torch.device, dst: Path, opset: int = 20
+    model: torch.nn.Module, imgsz: int, device: torch.device, dst: Path, opset: int = 17
 ) -> Path | None:
+    """Export ``model`` (quantized or FP32) to ONNX via ModelOpt's deploy path.
+
+    A quantized model yields a Q/DQ ONNX (INT8 explicit quantization for TRT);
+    an FP32 model yields a plain ONNX baseline.
+    """
     dummy = torch.randn(1, 3, imgsz, imgsz, device=device)
     wrapper = _RFDETRTracingWrapper(model).to(device).eval()
     try:
-        onnx_bytes = _modelopt_onnx_bytes(wrapper, dummy, onnx_opset=opset)
+        with _patch_interpolate_no_antialias():
+            onnx_bytes = _modelopt_onnx_bytes(wrapper, dummy, onnx_opset=opset)
     except Exception as exc:
         print(f"  [export] WARN: ONNX export failed (opset {opset}): {exc!r}")
         return None
@@ -536,7 +569,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Export
     p.add_argument("--no-export", action="store_true", help="Skip ONNX export")
-    p.add_argument("--onnx-opset", type=int, default=20)
+    p.add_argument("--onnx-opset", type=int, default=17)
     return p.parse_args(argv)
 
 
