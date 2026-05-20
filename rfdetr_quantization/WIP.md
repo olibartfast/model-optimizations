@@ -1,6 +1,6 @@
 # RF-DETR INT8 Quantization — Work In Progress
 
-Branch: `rfdetr-quant`. Tracks the in-flight goal *"INT8 QAT quantization on
+Branch: `feature/rfdetr-quant`. Tracks the goal *"INT8 QAT quantization on
 RF-DETR using NVIDIA ModelOpt"* started 2026-05-18.
 
 ---
@@ -11,41 +11,105 @@ RF-DETR using NVIDIA ModelOpt"* started 2026-05-18.
 |---|---|---|
 | Architecture scouting | ✅ done | LWDETR: backbone (DINOv2 ViT) + transformer + heads (`class_embed` Linear + `bbox_embed` MLP); 155 Linear, 54 LayerNorm, 9 Conv2d, 2 MultiheadAttention. |
 | Dependency conflict | ✅ resolved | `rfdetr` requires transformers≥5; modelopt's HF plugin used the removed `transformers.modeling_utils.Conv1D`. Patched the plugin to guard that registration (`quantization_venv/.../plugins/huggingface.py:209`). |
-| Calibration pipeline | ✅ working | Bypass rfdetr's val transforms (brittle on Albumentations 2.x); hand-built loader does cv2 resize → /255 → ImageNet normalize → `NestedTensor`. |
-| PTQ smoke (32 imgs) | ✅ passes | `mtq.quantize` inserts 498 `TensorQuantizer` modules; post-PTQ forward returns valid `pred_logits (B,300,91)` + `pred_boxes (B,300,4)`. |
-| `mto.save` checkpoint | ✅ works | 122.6 MB for rfdetr-nano @ 256 calib images. |
-| ONNX export | ⚠️ partial | Hits `aten::_upsample_bicubic2d_aa` not supported in opset 17 (used by DINOv2 backbone for positional-encoding resample). Defer until QAT recipe is locked; retry with opset 20+. |
-| mAP evaluator | ❌ not yet | Need to wire up `rfdetr.evaluation.coco_eval.CocoEvaluator` against the quantized model so we can measure PTQ accuracy. |
-| QAT loop | ❌ not yet | LWDETR.forward(samples, targets) emits loss when targets are passed; criterion is internal. Plan: mirror `run_distillation_qat` pattern — teacher FP32 + student INT8 + MSE on (pred_logits, pred_boxes) + supervised criterion. |
+| Calibration pipeline | ✅ working | Bypass rfdetr's val transforms (brittle on Albumentations 2.x); hand-built loader does cv2 square resize → /255 → ImageNet normalize → `NestedTensor`. RF-DETR resizes to a square by design, so this is the *correct* preprocessing. |
+| PTQ | ✅ working | `mtq.quantize` inserts ~498 `TensorQuantizer` modules; `*class_embed*` / `*bbox_embed*` heads excluded. |
+| mAP evaluator | ✅ done | `evaluate_map` runs COCO `val2017` through the quantized model + `PostProcess` and scores via rfdetr's `CocoEvaluator` (raw COCO category ids, no remap). |
+| QAT distillation loop | ✅ done | FP32 teacher / INT8 student, **backbone feature-map distillation** (normalized MSE); Adam low/high/low ladder; per-epoch eval + best-checkpoint rollback. |
+| e2e pipeline | ✅ done | `main()` runs FP32 eval → PTQ → PTQ eval → QAT → QAT eval → ONNX, with stage skip/resume flags. |
+| ONNX export | ❌ blocked | Fails on `aten::_upsample_bicubic2d_aa` (DINOv2 positional-encoding resample) at opset 17 *and* 20. Needs a static-interpolation patch of the backbone resample before tracing. |
 | TRT speedup measurement | ❌ blocked on ONNX export | |
+
+---
+
+## The QAT objective — why output-level distillation fails on DETR
+
+Two QAT attempts with **output-level** distillation failed:
+
+1. *Naive per-query MSE on `(pred_logits, pred_boxes)`* — collapsed mAP from
+   ~0.49 (PTQ) to ~0.003. Root cause: **DETR predictions are an unordered
+   set.** Of the 300 queries only a handful predict real objects; the rest are
+   "no-object" queries whose `pred_boxes` are arbitrary, so a plain per-query
+   box MSE is dominated by ~270 junk boxes and trains the student to fit noise.
+2. *Confidence-weighted box MSE* (box term weighted by teacher
+   `sigmoid(logits).amax(-1)`) — better, but still wrong: best epoch 0.4647 vs
+   PTQ 0.4917, and the higher LR rungs still collapsed it to ~0.01. Even the
+   gentlest epoch regressed. Decoder query slots are simply not stably aligned
+   between two slightly different models, so *any* per-slot loss on the final
+   predictions is a miscalibrated objective.
+
+**Working objective — backbone feature distillation** (`_feature_distill_loss`):
+distill the *spatial backbone feature maps* `[B,C,H,W]`, which are perfectly
+position-aligned, so a plain normalized MSE is a correct and stable target.
+The DINOv2 ViT backbone is 23.3M of RF-DETR-nano's 30.5M params and the
+dominant INT8-error source; QAT trains only the backbone quantized weights to
+pull their features back onto the FP32 manifold. The transformer/head
+quantizers (small PTQ loss) are left as-is.
+
+QAT also: runs only `model.backbone` per step (skips transformer + heads —
+much faster, less memory), clips grad-norm (default 1.0), uses one Adam
+instance across epochs (momentum carries; only LR steps via the low/high/low
+ladder), evaluates every `--qat-eval-every` epochs, and **rolls back to the
+best-mAP epoch**.
 
 ---
 
 ## Pipeline module
 
-`rfdetr_quantization/nvidia_modelopt_rfdetr_qat.py` is the canonical entry
-point for now. Currently ships:
+`rfdetr_quantization/nvidia_modelopt_rfdetr_qat.py` — the canonical e2e entry
+point. Stages (each skippable / resumable):
 
-- `load_rfdetr(variant, device)` — variants `rfdetr-{nano,small,medium,base,large}`.
-- `build_calib_batches(image_dir, size, batch, num_samples, device, seed)` —
-  COCO val2017 calibration set as `NestedTensor` batches at the model's native
-  resolution (384 for nano).
-- `build_quant_cfg(mtq, head_excludes=("*class_embed*", "*bbox_embed*"))` —
-  INT8 cfg with DETR-head exclusions analogous to YOLO's DFL/Detect-output.
-- `run_ptq(model, calib_batches, ...)` — `mtq.quantize` + quantizer count.
-- `export_onnx(model, imgsz, device, dst)` — wraps the LWDETR in
-  `_RFDETRTracingWrapper` (synthesises the pad mask) and routes through
-  ModelOpt's deploy ONNX bytes path. Currently fails on opset-17 due to
-  bicubic-AA upsample in the backbone — known issue.
-- `main()` — CLI entry: `--model rfdetr-nano --calib-size 256 --imgsz 0
-  --batch 4 --device 0 --seed 0`.
+1. **FP32 eval** — COCO `val2017` mAP of the unquantized model.
+2. **PTQ calibrate** — `mtq.quantize` over `--calib-size` val2017 images, or
+   `--from-ptq <ckpt>` to restore and skip calibration.
+3. **PTQ eval** — mAP of the calibrated INT8 model.
+4. **QAT distill** — `run_distillation_qat` (see above).
+5. **QAT eval** — mAP of the best QAT epoch.
+6. **ONNX export** — `_RFDETRTracingWrapper` + ModelOpt deploy path (currently
+   fails, see status table).
 
-Run::
+Outputs land in `runs/modelopt_qat/rfdetr_nano/`: `*_ptq.pth`, `*_qat.pth`,
+`summary.json` (per-stage mAP), `qat_train.csv` (per-epoch loss + mAP).
+
+Full run::
 
     quantization_venv/bin/python rfdetr_quantization/nvidia_modelopt_rfdetr_qat.py \
-      --model rfdetr-nano --calib-size 256 --batch 4 --seed 0
+      --model rfdetr-nano --calib-size 256 --qat-epochs 4 --qat-images 960
 
-Output: `runs/modelopt_qat/rfdetr_nano/rfdetr_nano_ptq.pth` + `summary.json`.
+Resume QAT from a saved PTQ checkpoint (skips calibration)::
+
+    quantization_venv/bin/python rfdetr_quantization/nvidia_modelopt_rfdetr_qat.py \
+      --model rfdetr-nano --skip-fp32-eval \
+      --from-ptq runs/modelopt_qat/rfdetr_nano/rfdetr_nano_ptq.pth \
+      --qat-epochs 4 --qat-images 960
+
+Useful flags: `--eval-limit N` (cap eval images), `--skip-qat` (PTQ-only),
+`--qat-source {train,val}` (QAT image pool; `train` avoids the eval leak),
+`--qat-lr / --qat-low-lr`, `--qat-eval-every N`, `--no-export`.
+
+---
+
+## Latest metrics (rfdetr-nano, COCO val2017)
+
+Eval: first 1500 `val2017` images, `PostProcess` num_select=300, COCO `bbox`
+AP. PTQ calibrated on 256 `val2017` images; QAT = backbone feature
+distillation, 6 epochs × 960 `train2017` images, batch 2, Adam low/high/low
+ladder (1e-6 / 1e-5), best-epoch rollback.
+
+| Stage | mAP50-95 | mAP50 | Δ vs FP32 |
+|---|---|---|---|
+| FP32   | 0.5001 | 0.6875 | — |
+| INT8 PTQ | 0.4917 | 0.6779 | −0.0084 |
+| INT8 QAT | **0.4925** | 0.6778 | −0.0076 (**+0.0008 over PTQ**) |
+
+QAT recovers ~10% of the PTQ gap and, crucially, is **stable** — no collapse,
+QAT ≥ PTQ. The low-LR epochs (1e-6) hold/recover; the 1e-5 rung perturbs
+slightly (epoch 4 dipped to 0.4854), and best-epoch rollback keeps the epoch-6
+0.4925 checkpoint. This matches the YOLO QAT bar ("within ~0.001 mAP of PTQ").
+Per-epoch trace in `runs/modelopt_qat/rfdetr_nano/qat_train.csv`.
+
+Headroom for a follow-up: QAT only fine-tunes the backbone; the transformer +
+head quantizers are left at their PTQ state. Extending feature distillation to
+the transformer encoder memory (also position-aligned) is the next lever.
 
 ---
 
@@ -53,71 +117,43 @@ Output: `runs/modelopt_qat/rfdetr_nano/rfdetr_nano_ptq.pth` + `summary.json`.
 
 | Decision | Choice | Reason |
 |---|---|---|
-| Calibration data | COCO `val2017` (same as yolo pipeline) | Reuses existing dataset; calibration is statistics-only so leakage is mild. |
-| Calibration loader | Hand-built `cv2`+ImageNet normalize | RF-DETR's `make_coco_transforms` relies on Albumentations 1.x transform names that fail silently on 2.x. Sidestepping for calibration only. |
-| Head exclusions | `*class_embed*`, `*bbox_embed*` | DETR analog of YOLO single-head DFL+Detect-output exclusion: the final-prediction Linears (91-class logits and 4-coord box MLP) are accuracy-critical and worth keeping FP32. |
-| LayerNorm / Embedding | Not explicitly excluded | ModelOpt's `INT8_DEFAULT_CFG` already skips these by op type; no extra config needed. |
-| Calibration size | 256 images (CLI default) | Matches the ~260 used in the YOLO `yolo11-distill` recipe — proven sufficient for histogram-style calibration on 384px inputs. |
-| Variant for first smoke | `rfdetr-nano` (30.5M params, 384px) | Smallest, lowest VRAM, fastest iteration. Other variants flagged in `RFDETR_VARIANTS`. |
-| Repo location | `rfdetr_quantization/` | Sits next to `yolo_quantization/{ptq,qat}/`. Top-level dir name is now misleading; rename to `model_quantization/` is a follow-up if the rfdetr work matures. |
+| QAT objective | Backbone feature-map distillation | Avoids RF-DETR's brittle Albumentations target transforms *and* the DETR set-prediction mismatch — feature maps are position-aligned so MSE is correct (see above). |
+| QAT image pool | COCO `train2017` (default `--qat-source train`) | No labels are used, but training on `train2017` keeps the QAT data disjoint from the `val2017` eval set. |
+| Calibration data | COCO `val2017` | Reuses the existing dataset; calibration is statistics-only so leakage is mild. |
+| Preprocessing | cv2 square resize + ImageNet normalize | RF-DETR resizes inputs to a square by design; `PostProcess` rescales boxes by the original image size, undoing the distortion. |
+| Head exclusions | `*class_embed*`, `*bbox_embed*` | DETR analog of YOLO's DFL + Detect-output exclusion: the final-prediction Linears are accuracy-critical and kept FP32. |
+| Best-epoch rollback | Checkpoint the highest-mAP epoch | QAT can overshoot; the lowest-loss epoch is not always the highest-mAP one. |
+| Variant for first runs | `rfdetr-nano` (30.5M params, 384px) | Smallest, lowest VRAM, fastest iteration. |
 
 ---
 
 ## Open questions / next steps
 
-1. **mAP evaluator wiring.** Need a small `rfdetr_eval.py` helper that runs the
-   quantized model through COCO val2017 and computes mAP via
-   `rfdetr.evaluation.coco_eval.CocoEvaluator`. Blocks accuracy verification.
-2. **QAT distillation loop.** Pattern to copy from
-   `yolo_quantization/qat/nvidia_modelopt_yolo_qat.py:run_distillation_qat`:
-   - frozen FP32 teacher + INT8 student on same batch
-   - supervised criterion = `model(samples, targets)["loss"]` (LWDETR built-in)
-   - distill MSE on `(pred_logits, pred_boxes)` outputs
-   - per-tensor-normalized MSE (same shape concern as YOLO)
-   - Adam @ 1e-5 with low/high/low LR ladder
-3. **ONNX export.** Retry with `onnx_opset=20` (supports
-   `_upsample_bicubic2d_aa`), or pre-process the DINOv2 positional-encoding
-   resample to a static interpolation before tracing.
-4. **TRT speedup.** Once ONNX exports, reuse `scripts/measure_speedup.sh` —
-   it's model-agnostic. Add an `rfdetr-nano` row to the README table.
-5. **Repo layout.** If RF-DETR support grows, rename the top-level package
-   from `yolo_quantization/` to `model_quantization/` and split YOLO and
-   RF-DETR into sibling subdirs.
+1. **ONNX export.** Patch the DINOv2 positional-encoding resample to a static
+   interpolation (or a non-AA `bicubic`) before tracing so the graph no longer
+   emits `aten::_upsample_bicubic2d_aa`. Blocks TRT benchmarking.
+2. **TRT speedup.** Once ONNX exports, reuse `scripts/measure_speedup.sh`.
+3. **Supervised QAT.** Distillation recovers most of the PTQ gap; a supervised
+   `SetCriterion` fine-tune (with Hungarian matching) is the next lever if more
+   accuracy is needed — it would need COCO targets in DETR format.
+4. **Repo layout.** If RF-DETR support grows, rename the top-level package from
+   `yolo_quantization/` to `model_quantization/` and split the workstreams.
 
 ---
 
 ## Bugs / gotchas discovered along the way
 
-- **modelopt + transformers 5.x.** Required a one-line patch to
-  `modelopt/torch/quantization/plugins/huggingface.py` to guard the missing
-  `Conv1D` attribute. The fix is generic (uses `getattr(..., None)`), not
-  RF-DETR-specific. **Should be upstreamed to NVIDIA/Model-Optimizer.**
+- **DETR set-prediction vs. per-slot distillation.** See the QAT objective
+  section — the single most important gotcha. Distill *features*, not the
+  set-valued `pred_*` outputs.
+- **modelopt + transformers 5.x.** One-line guard patch in
+  `modelopt/torch/quantization/plugins/huggingface.py` for the missing
+  `Conv1D` attribute. Generic (`getattr(..., None)`); should be upstreamed.
 - **rfdetr Albumentations transforms.** `make_coco_transforms('val', ...)`
-  registers `SmallestMaxSize` / `LongestMaxSize` via `getattr(A, name)` but
-  silently falls back to no resize when Albumentations 2.x changes the
-  builder interaction. The dataset then yields full-resolution images,
-  causing the DINOv2 backbone to assert on shape divisibility.
+  silently falls back to no-resize on Albumentations 2.x — sidestepped for
+  both calibration and eval.
+- **`PROJECT_ROOT` was off by one.** After the move to a top-level package the
+  path computation pointed one directory above the repo root; fixed to
+  `Path(__file__).resolve().parent.parent`.
 - **`transformers.use_return_dict` deprecation warning** prints on every
-  forward in transformers 5.x; cosmetic, not a functional issue.
-
----
-
-## Reproducing the current state
-
-```bash
-# 1. Branch
-git checkout rfdetr-quant
-
-# 2. Install (transformers gets pinned to 5.x by rfdetr; modelopt plugin needs the
-#    Conv1D guard patch — see the file edit in the diff for this branch)
-quantization_venv/bin/pip install rfdetr pycocotools albumentations
-
-# 3. Symlink classic-COCO layout from our Ultralytics layout
-mkdir -p datasets/coco_rfdetr/annotations
-ln -s ../coco/images/val2017 datasets/coco_rfdetr/val2017
-ln -s ../../coco/annotations/instances_val2017.json datasets/coco_rfdetr/annotations/
-
-# 4. Run PTQ smoke (saves *_ptq.pth)
-quantization_venv/bin/python rfdetr_quantization/nvidia_modelopt_rfdetr_qat.py \
-  --model rfdetr-nano --calib-size 32 --batch 4 --seed 0
-```
+  forward in transformers 5.x; cosmetic.

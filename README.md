@@ -76,7 +76,7 @@ are within statistical noise of their FP32 ONNX baselines.
   - `qat/nvidia_modelopt_yolo_qat.py` - Quantization-Aware Training (torch-based, INT8)
   - `qat/README.md` - Active YOLO26 QAT log: metrics, recipe, resume commands
 - `rfdetr_quantization/` - RF-DETR quantization workstream
-  - `nvidia_modelopt_rfdetr_qat.py` - RF-DETR PTQ + ONNX export entry point (WIP)
+  - `nvidia_modelopt_rfdetr_qat.py` - RF-DETR e2e INT8 pipeline: FP32 eval -> PTQ -> QAT distill -> eval -> ONNX
   - `WIP.md` - RF-DETR status, known issues, and next steps
 - `examples/` - Tutorials and small environment examples
 - `configs/` - `coco.yaml` and `requirements.txt`
