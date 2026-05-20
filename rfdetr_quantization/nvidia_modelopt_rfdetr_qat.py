@@ -24,7 +24,7 @@ This module ships PTQ + ONNX export. QAT loop and mAP eval are the next steps
 
 Usage::
 
-    python yolo_quantization/rfdetr/nvidia_modelopt_rfdetr_qat.py \\
+    python rfdetr_quantization/nvidia_modelopt_rfdetr_qat.py \\
         --model rfdetr-nano --calib-size 256 --imgsz 384 --device 0
 """
 
