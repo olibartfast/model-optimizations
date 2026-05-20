@@ -23,7 +23,7 @@ RF-DETR using NVIDIA ModelOpt"* started 2026-05-18.
 
 ## Pipeline module
 
-`yolo_quantization/rfdetr/nvidia_modelopt_rfdetr_qat.py` is the canonical entry
+`rfdetr_quantization/nvidia_modelopt_rfdetr_qat.py` is the canonical entry
 point for now. Currently ships:
 
 - `load_rfdetr(variant, device)` — variants `rfdetr-{nano,small,medium,base,large}`.
@@ -42,7 +42,7 @@ point for now. Currently ships:
 
 Run::
 
-    quantization_venv/bin/python yolo_quantization/rfdetr/nvidia_modelopt_rfdetr_qat.py \
+    quantization_venv/bin/python rfdetr_quantization/nvidia_modelopt_rfdetr_qat.py \
       --model rfdetr-nano --calib-size 256 --batch 4 --seed 0
 
 Output: `runs/modelopt_qat/rfdetr_nano/rfdetr_nano_ptq.pth` + `summary.json`.
@@ -59,7 +59,7 @@ Output: `runs/modelopt_qat/rfdetr_nano/rfdetr_nano_ptq.pth` + `summary.json`.
 | LayerNorm / Embedding | Not explicitly excluded | ModelOpt's `INT8_DEFAULT_CFG` already skips these by op type; no extra config needed. |
 | Calibration size | 256 images (CLI default) | Matches the ~260 used in the YOLO `yolo11-distill` recipe — proven sufficient for histogram-style calibration on 384px inputs. |
 | Variant for first smoke | `rfdetr-nano` (30.5M params, 384px) | Smallest, lowest VRAM, fastest iteration. Other variants flagged in `RFDETR_VARIANTS`. |
-| Repo location | `yolo_quantization/rfdetr/` | Sits next to `yolo_quantization/{ptq,qat}/`. Top-level dir name is now misleading; rename to `model_quantization/` is a follow-up if the rfdetr work matures. |
+| Repo location | `rfdetr_quantization/` | Sits next to `yolo_quantization/{ptq,qat}/`. Top-level dir name is now misleading; rename to `model_quantization/` is a follow-up if the rfdetr work matures. |
 
 ---
 
@@ -118,6 +118,6 @@ ln -s ../coco/images/val2017 datasets/coco_rfdetr/val2017
 ln -s ../../coco/annotations/instances_val2017.json datasets/coco_rfdetr/annotations/
 
 # 4. Run PTQ smoke (saves *_ptq.pth)
-quantization_venv/bin/python yolo_quantization/rfdetr/nvidia_modelopt_rfdetr_qat.py \
+quantization_venv/bin/python rfdetr_quantization/nvidia_modelopt_rfdetr_qat.py \
   --model rfdetr-nano --calib-size 32 --batch 4 --seed 0
 ```
