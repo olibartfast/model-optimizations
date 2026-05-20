@@ -65,6 +65,7 @@ AO_QAT_RECIPES: dict[str, dict[str, Any]] = {
         "exclude_dfl_quant": False,
         "disable_detect_output_quant": False,
         "disable_conv_output_quant": True,
+        "keep_detect_head_fp32": True,
     },
     "yolo11-ao-distill": {
         "qat_epochs": 10,
@@ -74,10 +75,11 @@ AO_QAT_RECIPES: dict[str, dict[str, Any]] = {
         "qat_distill_weight": 1.0,
         "qat_supervised_weight": 1.0,
         "calib_size": 1024,
-        "ao_activation_observer": "moving_average_minmax",
+        "ao_activation_observer": "histogram",
         "exclude_dfl_quant": True,
         "disable_detect_output_quant": True,
         "disable_conv_output_quant": False,
+        "keep_detect_head_fp32": True,
     },
 }
 
@@ -106,6 +108,7 @@ def _apply_ao_recipe(args, explicit_flags: set[str]) -> str:
         "exclude_dfl_quant": "--exclude-dfl-quant",
         "disable_detect_output_quant": "--disable-detect-output-quant",
         "disable_conv_output_quant": "--disable-conv-output-quant",
+        "keep_detect_head_fp32": "--keep-detect-head-fp32",
     }
     applied: list[str] = []
     for key, value in AO_QAT_RECIPES[resolved].items():
@@ -490,6 +493,7 @@ def run_ao_qat_for_model(
     exclude_dfl_quant: bool,
     disable_detect_output_quant: bool,
     disable_conv_output_quant: bool,
+    keep_detect_head_fp32: bool,
     enable_residual_add_quant: bool,
     ao_activation_observer: str,
     keep_fp32_modules: list[str] | None,
@@ -527,6 +531,16 @@ def run_ao_qat_for_model(
     exclude_prefixes = list(keep_fp32_modules or [])
     if exclude_dfl_quant:
         exclude_prefixes.extend(find_dfl_module_paths(yolo.model))
+    if keep_detect_head_fp32:
+        # Keep the whole Detect head in FP32. AO's symmetric-int8 quantizers on
+        # the detect-head prediction towers cost ~0.013 mAP50-95 at PTQ; the
+        # backbone/neck stay INT8. Robust across YOLO families (matches the
+        # Detect module by type, not by index).
+        detect_paths = [
+            name for name, module in yolo.model.named_modules()
+            if isinstance(module, Detect) and name
+        ]
+        exclude_prefixes.extend(p for p in detect_paths if p not in exclude_prefixes)
     if disable_conv_output_quant:
         disable_output_quant_prefixes = [
             name for name, module in yolo.model.named_modules() if isinstance(module, torch.nn.Conv2d)
@@ -578,6 +592,7 @@ def run_ao_qat_for_model(
         "exclude_dfl_quant": exclude_dfl_quant,
         "disable_detect_output_quant": disable_detect_output_quant,
         "disable_conv_output_quant": disable_conv_output_quant,
+        "keep_detect_head_fp32": keep_detect_head_fp32,
         "enable_residual_add_quant": enable_residual_add_quant,
         "ao_activation_observer": ao_activation_observer,
         "ao_residual_adds": patched_residual_adds,
@@ -788,6 +803,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Disable AO Conv output fake quant on every Conv2d (input/weight fake quant stay enabled). Ablation switch.",
     )
+    p.add_argument(
+        "--keep-detect-head-fp32",
+        action="store_true",
+        help="Keep the whole Ultralytics Detect head in FP32 (no input/weight/output fake quant). "
+        "Recovers ~0.013 mAP50-95 vs quantizing it; backbone and neck stay INT8.",
+    )
     p.add_argument("--keep-fp32-modules", nargs="+", default=[], metavar="MODULE")
     p.add_argument("--freeze-teacher-bn", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--freeze-student-bn", action="store_true")
@@ -855,6 +876,7 @@ def main(argv: list[str] | None = None) -> int:
                     exclude_dfl_quant=args.exclude_dfl_quant,
                     disable_detect_output_quant=args.disable_detect_output_quant,
                     disable_conv_output_quant=args.disable_conv_output_quant,
+                    keep_detect_head_fp32=args.keep_detect_head_fp32,
                     enable_residual_add_quant=args.enable_residual_add_quant,
                     ao_activation_observer=args.ao_activation_observer,
                     keep_fp32_modules=args.keep_fp32_modules or None,

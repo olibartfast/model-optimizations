@@ -94,6 +94,34 @@ def test_apply_yolo26_ao_recipe_disables_conv_output_quant_by_default():
     assert resolved == "yolo26-ao-distill"
     assert args.disable_conv_output_quant is True
     assert args.ao_activation_observer == "histogram"
+    assert args.keep_detect_head_fp32 is True
+
+
+def test_both_ao_recipes_keep_detect_head_fp32_by_default():
+    module = _load_ao_module()
+
+    for recipe in ("yolo26-ao-distill", "yolo11-ao-distill"):
+        assert module.AO_QAT_RECIPES[recipe]["keep_detect_head_fp32"] is True
+
+    # An explicit --keep-detect-head-fp32 on the CLI must not be overridden.
+    args = SimpleNamespace(
+        ao_recipe="yolo26-ao-distill",
+        models=["yolo26s"],
+        qat_epochs=10,
+        qat_batches_per_epoch=200,
+        qat_lr=1e-5,
+        qat_low_lr=1e-6,
+        qat_distill_weight=1.0,
+        qat_supervised_weight=1.0,
+        calib_size=260,
+        ao_activation_observer="histogram",
+        exclude_dfl_quant=False,
+        disable_detect_output_quant=False,
+        disable_conv_output_quant=False,
+        keep_detect_head_fp32=True,
+    )
+    module._apply_ao_recipe(args, {"--keep-detect-head-fp32"})
+    assert args.keep_detect_head_fp32 is True
 
 
 def test_prepare_pytorch_ao_fake_quant_wraps_conv2d_and_preserves_forward_shape():

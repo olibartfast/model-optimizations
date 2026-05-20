@@ -54,12 +54,12 @@ INT8 QAT was evaluated on COCO `val2017` with `conf=0.001`, `iou=0.6`, and `imgs
 | ----------- | ------------------- | -------: | --------: | ----------: | --------: |
 | **yolo26s** | FP32 baseline       |   0.4718 |         — |     6.24 ms |     1.00× |
 |             | ModelOpt INT8 QAT   |   0.4701 |     −0.4% |     2.60 ms | **2.40×** |
-|             | PyTorch AO INT8 QAT |   0.4551 |     −3.6% |     2.04 ms | **3.08×** |
+|             | PyTorch AO INT8 QAT |   0.4661 |     −1.2% |     2.23 ms | **2.81×** |
 | **yolo11s** | FP32 baseline       |   0.4622 |         — |     6.04 ms |     1.00× |
 |             | ModelOpt INT8 QAT   |   0.4602 |     −0.4% |     2.48 ms | **2.44×** |
-|             | PyTorch AO INT8 QAT |   0.4511 |     −2.4% |     1.98 ms | **3.05×** |
+|             | PyTorch AO INT8 QAT |   0.4560 |     −1.3% |     2.23 ms | **2.68×** |
 
-**Current recommendation for YOLO:** use **ModelOpt INT8 QAT** for production-oriented INT8 deployment. On the tested models, it gives about **0.4% relative mAP50-95 loss** with roughly **2.4× TensorRT speedup**. Use the PyTorch AO path for recipe research only: it can produce faster engines, but with a larger accuracy drop.
+**Current recommendation for YOLO:** use **ModelOpt INT8 QAT** for production-oriented INT8 deployment. On the tested models, it gives about **0.4% relative mAP50-95 loss** with roughly **2.4× TensorRT speedup**. The PyTorch AO path is now close — within **≈1.3% relative mAP50-95** at a **2.7–2.8× speedup** — but remains a recipe-research path; ModelOpt is fully INT8 and slightly more accurate.
 
 ## Quick start
 
@@ -148,15 +148,15 @@ All numbers were validated on COCO `val2017` with `conf=0.001`, `iou=0.6`, and `
 | **yolo26s** | ModelOpt   | `yolo26-distill`    | FP32                     |     0.6384 |     0.4718 |           baseline |
 |             | ModelOpt   |                     | PTQ INT8                 |     0.6368 |     0.4706 |     −0.0012 ≈0.25% |
 |             | ModelOpt   |                     | **QAT INT8**             | **0.6370** | **0.4701** | **−0.0017 ≈0.36%** |
-|             | PyTorch AO | `yolo26-ao-distill` | PTQ INT8                 |     0.6257 |     0.4525 |      −0.0194 ≈4.1% |
-|             | PyTorch AO |                     | **QAT INT8**             | **0.6263** | **0.4551** |  **−0.0168 ≈3.6%** |
+|             | PyTorch AO | `yolo26-ao-distill` | PTQ INT8                 |     0.6321 |     0.4666 |      −0.0053 ≈1.1% |
+|             | PyTorch AO |                     | **QAT INT8**             | **0.6326** | **0.4661** |  **−0.0058 ≈1.2%** |
 | **yolo11s** | ModelOpt   | `yolo11-distill`    | FP32                     |     0.6376 |     0.4622 |           baseline |
 |             | ModelOpt   |                     | PTQ INT8                 |     0.6370 |     0.4614 |     −0.0008 ≈0.17% |
 |             | ModelOpt   |                     | **QAT INT8** best @ ep 2 | **0.6358** | **0.4602** | **−0.0020 ≈0.43%** |
-|             | PyTorch AO | `yolo11-ao-distill` | PTQ INT8                 |     0.6240 |     0.4494 |      −0.0128 ≈2.8% |
-|             | PyTorch AO |                     | **QAT INT8**             | **0.6292** | **0.4511** |  **−0.0111 ≈2.4%** |
+|             | PyTorch AO | `yolo11-ao-distill` | PTQ INT8                 |     0.6321 |     0.4582 |     −0.0040 ≈0.87% |
+|             | PyTorch AO |                     | **QAT INT8**             | **0.6337** | **0.4560** |  **−0.0062 ≈1.3%** |
 
-The PyTorch AO QAT step recovers mAP over its own PTQ baseline: +0.0026 for `yolo26s` and +0.0017 for `yolo11s`. ModelOpt PTQ is already near-lossless on the tested models, so QAT lands within about 0.001 of PTQ. AO still trails ModelOpt overall.
+Both AO recipes keep the Detect head in FP32 and calibrate with histogram observers (see [PyTorch AO quantization details](#pytorch-ao-quantization-details)); this brought AO PTQ to within 0.003–0.005 mAP50-95 of ModelOpt PTQ. Once PTQ is that strong the QAT step no longer helps — for AO (as for ModelOpt single-head models) QAT lands at or just below PTQ, so the deployable model is whichever stage scored higher.
 
 ## TensorRT speedup
 
@@ -168,12 +168,12 @@ The benchmark uses `scripts/measure_speedup.sh <stem>`, with `--ao` for the PyTo
 | ----------- | ---------- | -------- | -----------: | ---------: | --------: |
 | **yolo26s** | ModelOpt   | FP32     |      6.24 ms |  160.3 qps |     1.00× |
 |             | ModelOpt   | INT8 QAT |      2.60 ms |  385.0 qps | **2.40×** |
-|             | PyTorch AO | INT8 QAT |      2.04 ms |  490.6 qps | **3.08×** |
+|             | PyTorch AO | INT8 QAT |      2.23 ms |  448.5 qps | **2.81×** |
 | **yolo11s** | ModelOpt   | FP32     |      6.04 ms |  165.5 qps |     1.00× |
 |             | ModelOpt   | INT8 QAT |      2.48 ms |  403.5 qps | **2.44×** |
-|             | PyTorch AO | INT8 QAT |      1.98 ms |  503.5 qps | **3.05×** |
+|             | PyTorch AO | INT8 QAT |      2.23 ms |  448.4 qps | **2.68×** |
 
-The AO INT8 engine is faster than the ModelOpt engine because the `*-ao-distill` recipes disable Conv output fake-quant. The exported graph has fewer Q/DQ nodes, allowing TensorRT to fuse longer INT8 regions. This is an accuracy/latency trade-off, not a free speedup.
+The AO INT8 engine is still slightly faster than the ModelOpt engine because the `*-ao-distill` recipes disable Conv output fake-quant, so the graph has fewer Q/DQ nodes and TensorRT fuses longer INT8 regions. Keeping the Detect head in FP32 — the change that closed most of the accuracy gap — gives some speed back: AO measured 3.0–3.1× when the head was quantized, 2.7–2.8× with it in FP. Net, AO buys ≈0.011 mAP50-95 for ≈0.3× of speedup.
 
 ## Export accuracy: ONNX vs FP32 baseline
 
@@ -183,10 +183,10 @@ Q/DQ node counts verify graph topology, but not numerical fidelity. Exported ONN
 | ----------- | ---------- | ---------------------- | -----: | -------: | ----------------------: |
 | **yolo26s** | ModelOpt   | ONNX FP32 ORT baseline | 0.6362 |   0.4717 |                baseline |
 |             | ModelOpt   | ONNX INT8 QAT          | 0.6354 |   0.4700 |           −0.0017 ≈0.4% |
-|             | PyTorch AO | ONNX INT8 QAT          | 0.6252 |   0.4564 |           −0.0153 ≈3.2% |
+|             | PyTorch AO | ONNX INT8 QAT          | 0.6304 |   0.4659 |           −0.0058 ≈1.2% |
 | **yolo11s** | ModelOpt   | ONNX FP32 ORT baseline | 0.6336 |   0.4592 |                baseline |
 |             | ModelOpt   | ONNX INT8 QAT          | 0.6325 |   0.4572 |           −0.0020 ≈0.4% |
-|             | PyTorch AO | ONNX INT8 QAT          | 0.6265 |   0.4491 |           −0.0101 ≈2.2% |
+|             | PyTorch AO | ONNX INT8 QAT          | 0.6313 |   0.4544 |           −0.0048 ≈1.0% |
 
 The PyTorch-checkpoint vs ONNX-FP32 gap is about 0.003 for `yolo11s` and about 0.0001 for `yolo26s`. This appears to come from ONNX Runtime postprocessing roundoff and is independent of quantization.
 
@@ -202,6 +202,13 @@ The PyTorch AO path uses symmetric INT8 quantization:
 * weights: per-channel symmetric INT8.
 
 TensorRT rejects asymmetric `QuantizeLinear` nodes with non-zero zero-points on GPU, so the symmetric scheme is required for the exported Q/DQ ONNX graph to build as an INT8 engine.
+
+Two recipe choices close most of the accuracy gap to ModelOpt, both found by PTQ-only ablations on `yolo26s`:
+
+* **Detect head kept FP32** (`--keep-detect-head-fp32`, the default for both AO recipes). AO's symmetric-int8 quantizers on the detect-head prediction towers cost ≈0.013 mAP50-95; keeping the whole `Detect` module FP — backbone and neck stay INT8 — recovers it. This is the dominant fix: it took `yolo26s` PTQ from 0.4523 to 0.4655.
+* **Histogram activation observers** for both recipes. `HistogramObserver` clips activation outliers far better than `MovingAverageMinMaxObserver` (+0.0075 mAP50-95 at PTQ for `yolo11s`; histogram already won for `yolo26s`).
+
+With both, AO PTQ lands within 0.003–0.005 mAP50-95 of ModelOpt PTQ. The cost is speed: the FP Detect head drops the TensorRT speedup from ≈3.0× to ≈2.7×.
 
 Checkpoints and ONNX exports are saved under:
 
