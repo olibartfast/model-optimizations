@@ -179,6 +179,20 @@ def test_prepare_pytorch_ao_fake_quant_can_disable_all_output_quant():
     assert len(fake_quant_modules) == 4
 
 
+def test_patch_ao_residual_add_fake_quantizers_uses_shared_branch_quantizer():
+    module = _load_ao_module()
+    from ultralytics.nn.modules.block import Bottleneck
+
+    block = Bottleneck(4, 4)
+    patched = module.patch_ao_residual_add_fake_quantizers(block, "histogram")
+
+    assert patched == 1
+    assert block.add_lhs_fake_quant is block.add_rhs_fake_quant
+    assert block.add_lhs_fake_quant.activation_post_process.__class__.__name__ == "HistogramObserver"
+    y = block(torch.randn(1, 4, 8, 8))
+    assert y.shape == (1, 4, 8, 8)
+
+
 def test_ao_fake_quant_state_toggles_all_fake_quant_modules():
     module = _load_ao_module()
     model = torch.nn.Sequential(torch.nn.Conv2d(3, 4, 1))

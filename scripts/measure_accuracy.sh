@@ -34,21 +34,33 @@ cd "$PROJECT_ROOT"
 
 STEM="${1:-}"
 INCLUDE_ENGINE=0
+AO=0
 if [ -z "$STEM" ] || [[ "$STEM" == -* ]]; then
-    echo "Usage: $0 <model_stem> [--engine]" >&2
+    echo "Usage: $0 <model_stem> [--ao] [--engine]" >&2
     exit 2
 fi
 shift
 while [ $# -gt 0 ]; do
     case "$1" in
+        --ao) AO=1; shift ;;
         --engine) INCLUDE_ENGINE=1; shift ;;
         *) echo "Unknown arg: $1" >&2; exit 2 ;;
     esac
 done
 
-OUT_DIR="runs/modelopt_qat/$STEM"
+# Default backend is NVIDIA ModelOpt; --ao switches to the PyTorch AO export.
+if [ "$AO" -eq 1 ]; then
+    OUT_DIR="runs/pytorch_ao_qat/$STEM"
+    QAT_ONNX="$OUT_DIR/${STEM}_ao_qat.onnx"
+else
+    OUT_DIR="runs/modelopt_qat/$STEM"
+    QAT_ONNX="$OUT_DIR/${STEM}_qat.onnx"
+fi
+# FP32 baseline is backend-independent — reuse the ModelOpt FP32 ONNX if present.
 FP32_ONNX="$OUT_DIR/${STEM}_fp32.onnx"
-QAT_ONNX="$OUT_DIR/${STEM}_qat.onnx"
+if [ ! -f "$FP32_ONNX" ] && [ -f "runs/modelopt_qat/$STEM/${STEM}_fp32.onnx" ]; then
+    FP32_ONNX="runs/modelopt_qat/$STEM/${STEM}_fp32.onnx"
+fi
 PY="${PY:-}"
 if [ -z "$PY" ] && [ -n "${QUANTIZATION_VENV:-}" ]; then
     PY="$QUANTIZATION_VENV/bin/python"

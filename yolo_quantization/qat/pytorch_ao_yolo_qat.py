@@ -118,6 +118,30 @@ def _apply_ao_recipe(args, explicit_flags: set[str]) -> str:
     return resolved
 
 
+def make_ao_activation_fake_quant(observer: str) -> torch.nn.Module:
+    """Build an AO per-tensor symmetric int8 fake-quant module for activations.
+
+    Symmetric int8 (zero-point 0) is required for a TensorRT-deployable Q/DQ
+    export: TensorRT rejects asymmetric (non-zero zero-point) QuantizeLinear
+    nodes on GPU. Weights are already per-channel symmetric int8, so this keeps
+    the whole exported graph on the symmetric int8 path TensorRT can ingest.
+    """
+    from torch.ao.quantization import FakeQuantize, HistogramObserver, MovingAverageMinMaxObserver
+
+    observer_cls = {
+        "moving_average_minmax": MovingAverageMinMaxObserver,
+        "histogram": HistogramObserver,
+    }[observer]
+    return FakeQuantize(
+        observer=observer_cls,
+        quant_min=-128,
+        quant_max=127,
+        dtype=torch.qint8,
+        qscheme=torch.per_tensor_symmetric,
+        reduce_range=False,
+    )
+
+
 class AOConv2dQATWrapper(torch.nn.Module):
     """Conv2d wrapper using PyTorch AO fake quant for activation, weight, and output."""
 
@@ -131,29 +155,12 @@ class AOConv2dQATWrapper(torch.nn.Module):
         activation_observer: str = "moving_average_minmax",
     ) -> None:
         super().__init__()
-        from torch.ao.quantization import (
-            FakeQuantize,
-            HistogramObserver,
-            MovingAverageMinMaxObserver,
-            MovingAveragePerChannelMinMaxObserver,
-        )
-
-        activation_observer_cls = {
-            "moving_average_minmax": MovingAverageMinMaxObserver,
-            "histogram": HistogramObserver,
-        }[activation_observer]
+        from torch.ao.quantization import FakeQuantize, MovingAveragePerChannelMinMaxObserver
 
         self.conv = conv
         self.activation_observer = activation_observer
         self.activation_fake_quant = (
-            FakeQuantize(
-                observer=activation_observer_cls,
-                quant_min=0,
-                quant_max=255,
-                dtype=torch.quint8,
-                qscheme=torch.per_tensor_affine,
-                reduce_range=False,
-            )
+            make_ao_activation_fake_quant(activation_observer)
             if activation_quant
             else torch.nn.Identity()
         )
@@ -170,14 +177,7 @@ class AOConv2dQATWrapper(torch.nn.Module):
             else torch.nn.Identity()
         )
         self.output_fake_quant = (
-            FakeQuantize(
-                observer=activation_observer_cls,
-                quant_min=0,
-                quant_max=255,
-                dtype=torch.quint8,
-                qscheme=torch.per_tensor_affine,
-                reduce_range=False,
-            )
+            make_ao_activation_fake_quant(activation_observer)
             if output_quant
             else torch.nn.Identity()
         )
@@ -235,6 +235,78 @@ def prepare_pytorch_ao_fake_quant(
     for name, wrapper in replacements:
         _replace_child_module(model, name, wrapper)
     return len(replacements)
+
+
+
+def patch_ao_residual_add_fake_quantizers(model: torch.nn.Module, activation_observer: str) -> int:
+    """Patch common Ultralytics raw tensor adds to share one AO fake-quant scale."""
+    import types
+    from ultralytics.nn.modules.block import Bottleneck, CIB, GhostBottleneck, HGBlock, Residual, ResNetBlock
+
+    patched = 0
+
+    def _patch_single_add_module(module: torch.nn.Module, forward_fn) -> bool:
+        nonlocal patched
+        if getattr(module, "_ao_residual_add_patched", False):
+            return False
+        shared_fake_quant = make_ao_activation_fake_quant(activation_observer)
+        module.add_lhs_fake_quant = shared_fake_quant
+        module.add_rhs_fake_quant = shared_fake_quant
+        module._forward_no_ao_residual_quant = module.forward
+        module.forward = types.MethodType(forward_fn, module)
+        module._ao_residual_add_patched = True
+        patched += 1
+        return True
+
+    def bottleneck_forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.cv2(self.cv1(x))
+        if not self.add:
+            return y
+        return self.add_lhs_fake_quant(x) + self.add_rhs_fake_quant(y)
+
+    def ghost_bottleneck_forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.conv(x)
+        shortcut = self.shortcut(x)
+        return self.add_lhs_fake_quant(y) + self.add_rhs_fake_quant(shortcut)
+
+    def resnet_block_forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.cv3(self.cv2(self.cv1(x)))
+        shortcut = self.shortcut(x)
+        return torch.nn.functional.relu(self.add_lhs_fake_quant(y) + self.add_rhs_fake_quant(shortcut))
+
+    def hg_block_forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = [x]
+        y.extend(m(y[-1]) for m in self.m)
+        y = self.ec(self.sc(torch.cat(y, 1)))
+        if not self.add:
+            return y
+        return self.add_lhs_fake_quant(y) + self.add_rhs_fake_quant(x)
+
+    def cib_forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.cv1(x)
+        if not self.add:
+            return y
+        return self.add_lhs_fake_quant(x) + self.add_rhs_fake_quant(y)
+
+    def residual_forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.m(x)
+        return self.add_lhs_fake_quant(x) + self.add_rhs_fake_quant(y)
+
+    for module in model.modules():
+        if isinstance(module, Bottleneck) and getattr(module, "add", False):
+            _patch_single_add_module(module, bottleneck_forward)
+        elif isinstance(module, GhostBottleneck):
+            _patch_single_add_module(module, ghost_bottleneck_forward)
+        elif isinstance(module, ResNetBlock):
+            _patch_single_add_module(module, resnet_block_forward)
+        elif isinstance(module, HGBlock) and getattr(module, "add", False):
+            _patch_single_add_module(module, hg_block_forward)
+        elif isinstance(module, CIB) and getattr(module, "add", False):
+            _patch_single_add_module(module, cib_forward)
+        elif isinstance(module, Residual):
+            _patch_single_add_module(module, residual_forward)
+
+    return patched
 
 
 def iter_ao_fake_quant_modules(model: torch.nn.Module):
@@ -418,6 +490,7 @@ def run_ao_qat_for_model(
     exclude_dfl_quant: bool,
     disable_detect_output_quant: bool,
     disable_conv_output_quant: bool,
+    enable_residual_add_quant: bool,
     ao_activation_observer: str,
     keep_fp32_modules: list[str] | None,
     recipe: str,
@@ -471,8 +544,13 @@ def run_ao_qat_for_model(
         disable_output_quant_prefixes=disable_output_quant_prefixes,
         activation_observer=ao_activation_observer,
     )
+    patched_residual_adds = 0
+    if enable_residual_add_quant:
+        patched_residual_adds = patch_ao_residual_add_fake_quantizers(yolo.model, ao_activation_observer)
     yolo.model.to(torch_device)
     print(f"  [ao/prepare] wrapped {wrapped} Conv2d module(s)")
+    if patched_residual_adds:
+        print(f"  [ao/prepare] patched {patched_residual_adds} residual add module(s)")
     if exclude_prefixes:
         print(f"  [ao/prepare] excluded prefixes: {exclude_prefixes}")
     if disable_output_quant_prefixes:
@@ -500,7 +578,9 @@ def run_ao_qat_for_model(
         "exclude_dfl_quant": exclude_dfl_quant,
         "disable_detect_output_quant": disable_detect_output_quant,
         "disable_conv_output_quant": disable_conv_output_quant,
+        "enable_residual_add_quant": enable_residual_add_quant,
         "ao_activation_observer": ao_activation_observer,
+        "ao_residual_adds": patched_residual_adds,
         "keep_fp32_modules": keep_fp32_modules or [],
         "disable_output_quant_prefixes": disable_output_quant_prefixes,
         "ao_wrapped_convs": wrapped,
@@ -683,6 +763,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--qat-log-every", type=int, default=0)
     p.add_argument("--qat-eval-every", type=int, default=0)
     p.add_argument(
+        "--enable-residual-add-quant",
+        action="store_true",
+        help="Patch raw Ultralytics residual adds with a shared AO activation fake-quant module on both branches.",
+    )
+    p.add_argument(
         "--ao-activation-observer",
         choices=("moving_average_minmax", "histogram"),
         default="moving_average_minmax",
@@ -770,6 +855,7 @@ def main(argv: list[str] | None = None) -> int:
                     exclude_dfl_quant=args.exclude_dfl_quant,
                     disable_detect_output_quant=args.disable_detect_output_quant,
                     disable_conv_output_quant=args.disable_conv_output_quant,
+                    enable_residual_add_quant=args.enable_residual_add_quant,
                     ao_activation_observer=args.ao_activation_observer,
                     keep_fp32_modules=args.keep_fp32_modules or None,
                     recipe=resolved_recipe,
