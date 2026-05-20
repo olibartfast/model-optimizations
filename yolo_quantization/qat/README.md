@@ -162,15 +162,26 @@ hurts it.
 
 - INT4 QAT exploration: keep the production baseline on INT8 QAT until INT4 has its own smoke-tested path. Start with ModelOpt torch `INT4_AWQ_CFG` or `INT4_BLOCKWISE_WEIGHT_ONLY_CFG` as weight-only INT4 fine-tuning, then consider activation INT4 only after the weight-only path is stable.
 - Required smoke checks before any full COCO run: PTQ/restore succeeds, one-batch backward works, mAP is sane on a small validation slice, and ONNX export/deployability is verified. Do not treat activation+weight INT4 as ready or expected to work until those checks pass.
-- PyTorch AO alternative: `pytorch_ao_yolo_qat.py` is an experimental
-  fake-quant recipe path using `torch.ao.quantization` observers and
-  `FakeQuantize` around YOLO `Conv2d` layers. It is intended for YOLO11/YOLO26
-  recipe comparisons against ModelOpt, saves under `runs/pytorch_ao_qat/`, and
-  should not replace the canonical ModelOpt INT8 pipeline until export and
-  TensorRT deployability are validated. For `yolo26-ao-distill`, `auto` now
-  disables Conv output fake-quant and uses histogram activation observers by
-  default because the full yolo26s ablations improved QAT from 0.4495 to
-  0.4654 mAP50-95 while still trailing same-split ModelOpt PTQ at 0.4708.
+- PyTorch AO alternative: `pytorch_ao_yolo_qat.py` is a fake-quant recipe
+  path using `torch.ao.quantization` observers and `FakeQuantize` around YOLO
+  `Conv2d` layers. It is intended for YOLO11/YOLO26 recipe comparisons against
+  ModelOpt and saves under `runs/pytorch_ao_qat/`. Its activation fake-quant
+  is **symmetric int8** (`qint8`, `per_tensor_symmetric`, zero-point 0) so the
+  exported Q/DQ ONNX builds a TensorRT INT8 engine — `auto` for
+  `yolo26-ao-distill` disables Conv output fake-quant and uses histogram
+  activation observers. Validated end-to-end (full COCO `val2017`, 260/1024-img
+  calibration, 10 x 200 x batch-10 QAT):
+
+  | Model | AO PTQ INT8 | AO QAT INT8 | ModelOpt QAT INT8 | AO TRT speedup |
+  |---|---:|---:|---:|---:|
+  | yolo26s | 0.4525 | 0.4551 | 0.4701 | 3.08× |
+  | yolo11s | 0.4494 | 0.4511 | 0.4602 | 3.05× |
+
+  AO QAT recovers mAP over AO PTQ for both models but trails ModelOpt: its
+  symmetric-int8 activation quantizers are stricter than ModelOpt's calibrated
+  per-tensor quantizers. ModelOpt stays the canonical INT8 pipeline; the AO
+  path is kept for recipe research. Full PTQ/QAT/TRT/export-accuracy tables
+  live in the top-level [`README.md`](../../README.md).
 
 ---
 
@@ -232,7 +243,7 @@ python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --no-export
 ```
 
-Run the experimental PyTorch AO fake-quant recipe:
+Run the PyTorch AO fake-quant recipe:
 
 ```bash
 python yolo_quantization/qat/pytorch_ao_yolo_qat.py \
