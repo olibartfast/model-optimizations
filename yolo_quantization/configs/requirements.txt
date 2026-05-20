@@ -3,6 +3,7 @@ wheel
 # Install the core libraries
 ultralytics
 onnx
+onnxslim  # used by Ultralytics ONNX export simplification
 onnxruntime-gpu  # falls back to CPU if no CUDA; required by modelopt.onnx calibration
 opencv-python
 pycocotools
