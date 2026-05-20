@@ -24,20 +24,38 @@ auto-selected per model family by `--qat-recipe auto`:
 Full experiment log, resume commands, and the goal-tracking diary live in
 [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
 
-Result tables below compare two backends side-by-side:
+Two pipelines are compared side-by-side:
 
-- **NVIDIA ModelOpt** — canonical, deployable INT8 pipeline.
-- **PyTorch AO** — fake-quant path
-  ([`yolo_quantization/qat/pytorch_ao_yolo_qat.py`](yolo_quantization/qat/pytorch_ao_yolo_qat.py))
-  using `torch.ao.quantization` observers. Its activation fake-quant is
-  **symmetric int8** (zero-point 0), so the exported Q/DQ ONNX builds a
-  TensorRT INT8 engine — the AO rows below are now measured end-to-end, not
-  TBD. ModelOpt remains the canonical path; AO is kept for recipe comparison.
+- **NVIDIA ModelOpt** — the canonical, deployable INT8 pipeline.
+- **PyTorch AO** — a fake-quant path
+  ([`pytorch_ao_yolo_qat.py`](yolo_quantization/qat/pytorch_ao_yolo_qat.py))
+  using `torch.ao.quantization` observers, kept for recipe comparison.
 
-### Results (ModelOpt vs PyTorch AO) — INT8 PTQ + QAT on COCO `val2017`
+### Results at a glance
+
+INT8 QAT on COCO `val2017`, validated with `conf=0.001, iou=0.6, imgsz=640`
+on an RTX 3060 Laptop GPU; TensorRT latency at batch 1. Δ is the *relative*
+mAP50-95 change vs the FP32 baseline.
+
+| Model | Pipeline | mAP50-95 | Δ vs FP32 | TRT latency | Speedup |
+|---|---|---:|---:|---:|---:|
+| **yolo26s** | FP32 baseline       | 0.4718 | —     | 6.24 ms | 1.00× |
+|             | ModelOpt INT8 QAT   | 0.4701 | −0.4% | 2.60 ms | **2.40×** |
+|             | PyTorch AO INT8 QAT | 0.4551 | −3.6% | 2.04 ms | **3.08×** |
+| **yolo11s** | FP32 baseline       | 0.4622 | —     | 6.04 ms | 1.00× |
+|             | ModelOpt INT8 QAT   | 0.4602 | −0.4% | 2.48 ms | **2.44×** |
+|             | PyTorch AO INT8 QAT | 0.4511 | −2.4% | 1.98 ms | **3.05×** |
+
+**Takeaway:** ModelOpt INT8 QAT is near-lossless (≈0.4% relative mAP) at a
+2.4× TensorRT speedup — the recommended pipeline. PyTorch AO trades more
+accuracy (2–4%) for an even faster engine; use it for recipe research, not
+production. The three sections below break this down by stage, by latency,
+and by export fidelity.
+
+### Accuracy by stage — PTQ vs QAT on COCO `val2017`
 
 All numbers validated with `conf=0.001, iou=0.6, imgsz=640` on RTX 3060
-Laptop GPU.
+Laptop GPU. Δ shows absolute mAP50-95 loss and (relative %).
 
 | Model | Backend | Recipe | Stage | mAP50 | mAP50-95 | Δ mAP50-95 vs FP32 |
 |---|---|---|---|---:|---:|---:|
@@ -52,65 +70,60 @@ Laptop GPU.
 |             | PyTorch AO | `yolo11-ao-distill` | PTQ INT8 | 0.6240 | 0.4494 | -0.0128 (≈2.8%) |
 |             | PyTorch AO |                     | **QAT INT8** | **0.6292** | **0.4511** | **-0.0111 (≈2.4%)** |
 
-For both models the PyTorch AO QAT step recovers mAP over its PTQ baseline
-(+0.0026 yolo26s, +0.0017 yolo11s) but the AO path trails ModelOpt: AO's
-symmetric-int8 activation quantizers are stricter than ModelOpt's calibrated
-per-tensor quantizers, so its PTQ baseline starts ≈3-4% lower and QAT does not
-fully close the gap. ModelOpt stays the recommended INT8 pipeline.
+The PyTorch AO QAT step recovers mAP over its own PTQ baseline (+0.0026
+yolo26s, +0.0017 yolo11s). ModelOpt's PTQ is already near-lossless, so its
+QAT lands within ≈0.001 of PTQ. AO still trails ModelOpt overall — see
+[PyTorch AO QAT](#pytorch-ao-qat) for the symmetric-int8 reason.
 
-### TensorRT inference speedup (ModelOpt vs PyTorch AO) — batch=1, imgsz=640, RTX 3060 Laptop GPU
+### TensorRT speedup — batch 1, imgsz 640, RTX 3060 Laptop GPU
 
-Measured via `scripts/measure_speedup.sh <stem>` for ModelOpt and
-`scripts/measure_speedup.sh <stem> --ao` for PyTorch AO (trtexec 10.13.3,
-`--noTF32` on the FP32 engine for a strict-FP32 baseline). The FP32 engine is
-backend-independent; each `--ao` run re-measures it and the AO INT8 speedup is
-computed against that same-run FP32 number.
+Measured via `scripts/measure_speedup.sh <stem>` (`--ao` for the PyTorch AO
+export). trtexec 10.13.3, `--noTF32` on the FP32 engine for a strict-FP32
+baseline. The FP32 engine is backend-independent; each `--ao` run re-measures
+it and computes the AO speedup against that same-run FP32 number.
 
 | Model | Backend | Engine | Mean latency | Throughput | Speedup |
 |---|---|---|---:|---:|---:|
-| **yolo11s** | ModelOpt   | FP32     | 6.04 ms | 165.5 qps | 1.00× |
-|             | ModelOpt   | INT8 QAT | 2.48 ms | 403.5 qps | **2.44×** |
-|             | PyTorch AO | INT8 QAT | 1.98 ms | 503.5 qps | **3.05×** |
 | **yolo26s** | ModelOpt   | FP32     | 6.24 ms | 160.3 qps | 1.00× |
 |             | ModelOpt   | INT8 QAT | 2.60 ms | 385.0 qps | **2.40×** |
 |             | PyTorch AO | INT8 QAT | 2.04 ms | 490.6 qps | **3.08×** |
+| **yolo11s** | ModelOpt   | FP32     | 6.04 ms | 165.5 qps | 1.00× |
+|             | ModelOpt   | INT8 QAT | 2.48 ms | 403.5 qps | **2.44×** |
+|             | PyTorch AO | INT8 QAT | 1.98 ms | 503.5 qps | **3.05×** |
 
-The AO INT8 engine is faster than the ModelOpt INT8 engine because the
-`*-ao-distill` recipes disable Conv *output* fake-quant, so the exported graph
-carries fewer Q/DQ nodes and TensorRT fuses longer INT8 runs. That speed comes
-with the lower mAP shown above — a latency/accuracy trade-off, not a free win.
+The AO INT8 engine is faster than the ModelOpt one because the `*-ao-distill`
+recipes disable Conv *output* fake-quant: the exported graph carries fewer
+Q/DQ nodes, so TensorRT fuses longer INT8 runs. That speed is bought with the
+lower mAP above — a latency/accuracy trade-off, not a free win.
 
-### Export accuracy verification (ModelOpt vs PyTorch AO) — Ultralytics val on COCO `val2017`
+### Export accuracy — exported ONNX vs FP32 baseline (COCO `val2017`)
 
-Q/DQ node counts only verify graph topology, not numerical correctness. To
-confirm calibrated scales and FP fallback work end-to-end, the exported ONNX
-files are validated against the PT-checkpoint baseline via Ultralytics'
-onnxruntime backend (`scripts/measure_accuracy.sh <stem>`, add `--ao` for the
-PyTorch AO export). This executes the Q/DQ graph TensorRT ingests, so it is
-the relevant "did INT8 export break accuracy" measurement.
+Q/DQ node counts verify graph topology, not numerics. The exported ONNX is
+validated against the PT-checkpoint baseline through Ultralytics' onnxruntime
+backend (`scripts/measure_accuracy.sh <stem>`, `--ao` for the AO export),
+which executes the same Q/DQ graph TensorRT ingests.
 
 | Model | Backend | Format | mAP50 | mAP50-95 | Δ mAP50-95 vs FP32 ONNX |
 |---|---|---|---:|---:|---:|
-| **yolo11s** | ModelOpt   | ONNX FP32 (ort baseline) | 0.6336 | 0.4592 | baseline |
-|             | ModelOpt   | ONNX INT8 QAT            | 0.6325 | 0.4572 | −0.0020 (≈0.4%) |
-|             | PyTorch AO | ONNX INT8 QAT            | 0.6265 | 0.4491 | −0.0101 (≈2.2%) |
 | **yolo26s** | ModelOpt   | ONNX FP32 (ort baseline) | 0.6362 | 0.4717 | baseline |
 |             | ModelOpt   | ONNX INT8 QAT            | 0.6354 | 0.4700 | −0.0017 (≈0.4%) |
 |             | PyTorch AO | ONNX INT8 QAT            | 0.6252 | 0.4564 | −0.0153 (≈3.2%) |
+| **yolo11s** | ModelOpt   | ONNX FP32 (ort baseline) | 0.6336 | 0.4592 | baseline |
+|             | ModelOpt   | ONNX INT8 QAT            | 0.6325 | 0.4572 | −0.0020 (≈0.4%) |
+|             | PyTorch AO | ONNX INT8 QAT            | 0.6265 | 0.4491 | −0.0101 (≈2.2%) |
 
-For the ModelOpt rows, the PT-vs-ONNX-FP32 delta (≈0.003 for yolo11s,
-≈0.0001 for yolo26s) is onnxruntime postprocessing roundoff vs Ultralytics'
-native PyTorch path — independent of quantization. The ONNX-FP32-vs-ONNX-INT8
-delta is the relevant "did INT8 quantization break the export" measurement:
-both ModelOpt models are within statistical noise of their FP32 ONNX
-baselines, while the PyTorch AO INT8 export tracks its lower QAT-INT8 mAP
-(0.4564 vs the 0.4551 PT checkpoint for yolo26s; 0.4491 vs 0.4511 for
-yolo11s) — i.e. the export is faithful, the accuracy loss is the AO recipe's
-symmetric-int8 quantization itself, not an export bug. The literal TensorRT
-engine was not validated through Ultralytics because its `tensorrt` Python
-package (10.16) and the `trtexec` that builds the engine (10.13) disagree on
-the serialized engine format; the onnxruntime Q/DQ measurement above is the
-backend-independent stand-in.
+The PT-vs-ONNX-FP32 gap (≈0.003 yolo11s, ≈0.0001 yolo26s) is onnxruntime
+postprocessing roundoff, independent of quantization. The ONNX-FP32 →
+ONNX-INT8 delta is the real "did export break accuracy" check: ModelOpt INT8
+stays within noise of its FP32 ONNX, and PyTorch AO INT8 matches its own QAT
+checkpoint (0.4564 vs 0.4551 yolo26s; 0.4491 vs 0.4511 yolo11s) — the export
+is faithful; the AO loss is its quantization recipe, not an export bug.
+
+> **Note:** the TensorRT engine is benchmarked for *speed* but not validated
+> for *accuracy* through Ultralytics — the installed `tensorrt` Python package
+> (10.16) and the `trtexec` that builds the engine (10.13) disagree on the
+> serialized engine format. The onnxruntime Q/DQ run above is the
+> backend-independent accuracy stand-in.
 
 ### PyTorch AO QAT
 
