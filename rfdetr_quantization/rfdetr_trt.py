@@ -32,6 +32,7 @@ import json
 import statistics
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -186,6 +187,128 @@ def benchmark_engine(
 
 
 # ---------------------------------------------------------------------------
+# TensorRT layer profiling
+# ---------------------------------------------------------------------------
+
+def make_trt_layer_profiler():
+    """Create a TensorRT ``IProfiler`` subclass accepted by Python bindings."""
+    import tensorrt as trt
+
+    class TRTLayerProfiler(trt.IProfiler):
+        def __init__(self) -> None:
+            trt.IProfiler.__init__(self)
+            self.records: list[tuple[str, float]] = []
+
+        def report_layer_time(self, layer_name: str, ms: float) -> None:
+            self.records.append((layer_name, float(ms)))
+
+        def reset(self) -> None:
+            self.records.clear()
+
+    return TRTLayerProfiler()
+
+
+def _profile_group_name(layer_name: str) -> str:
+    name = layer_name.lower()
+    if "class_embed" in name or "bbox_embed" in name:
+        return "head"
+    if "mha" in name or "attention" in name:
+        return "mha_attention"
+    if "mlp/fc" in name or "__myl_fc" in name or "matmul" in name:
+        return "mlp_linear"
+    if "conv" in name or "projection" in name:
+        return "conv_projection"
+    if any(token in name for token in ("grid", "slice", "reshape", "transpose", "select", "topk", "softmax")):
+        return "graph_ops"
+    return "other"
+
+
+def _profile_summary(records: list[tuple[str, float]], *, topk: int) -> dict:
+    by_layer: dict[str, list[float]] = defaultdict(list)
+    for name, ms in records:
+        by_layer[name].append(ms)
+    layers = []
+    for name, values in by_layer.items():
+        total = float(sum(values))
+        layers.append(
+            {
+                "name": name,
+                "calls": len(values),
+                "total_ms": total,
+                "mean_ms": total / max(1, len(values)),
+            }
+        )
+    layers.sort(key=lambda row: row["total_ms"], reverse=True)
+    total_ms = float(sum(row["total_ms"] for row in layers))
+    group_totals: dict[str, dict] = {}
+    for row in layers:
+        group = _profile_group_name(row["name"])
+        item = group_totals.setdefault(group, {"total_ms": 0.0, "calls": 0, "layers": 0})
+        item["total_ms"] += row["total_ms"]
+        item["calls"] += row["calls"]
+        item["layers"] += 1
+    grouped_layers = []
+    for group, item in group_totals.items():
+        grouped_layers.append(
+            {
+                "group": group,
+                "total_ms": float(item["total_ms"]),
+                "percent": (100.0 * float(item["total_ms"]) / total_ms) if total_ms else 0.0,
+                "calls": int(item["calls"]),
+                "layers": int(item["layers"]),
+            }
+        )
+    grouped_layers.sort(key=lambda row: row["total_ms"], reverse=True)
+    return {
+        "total_profiled_ms": total_ms,
+        "num_layers": len(layers),
+        "grouped_layers": grouped_layers,
+        "top_layers": layers[:topk],
+    }
+
+
+def profile_engine_layers(
+    runner: TRTRunner,
+    imgsz: int,
+    device: torch.device,
+    *,
+    warmup: int = 10,
+    iters: int = 50,
+    topk: int = 25,
+    log_path: Path | None = None,
+) -> dict:
+    """Profile TensorRT layer timings using ``IExecutionContext.profiler``."""
+    profiler = make_trt_layer_profiler()
+    runner.context.profiler = profiler
+    dummy = torch.randn(1, 3, imgsz, imgsz, device=device)
+    for _ in range(warmup):
+        runner.infer(dummy)
+    torch.cuda.synchronize(device)
+    profiler.reset()
+    for _ in range(iters):
+        runner.infer(dummy)
+    torch.cuda.synchronize(device)
+    summary = _profile_summary(profiler.records, topk=topk)
+    summary["iters"] = iters
+    if log_path is not None:
+        lines = ["# grouped totals", "group,total_ms,percent,calls,layers"]
+        for row in summary["grouped_layers"]:
+            lines.append(
+                f"{row['group']},{row['total_ms']:.6f},{row['percent']:.2f},"
+                f"{row['calls']},{row['layers']}"
+            )
+        lines.extend(["", "# top layers", "rank,total_ms,mean_ms,calls,group,layer"])
+        for idx, row in enumerate(summary["top_layers"], 1):
+            lines.append(
+                f"{idx},{row['total_ms']:.6f},{row['mean_ms']:.6f},"
+                f"{row['calls']},{_profile_group_name(row['name'])},{row['name']}"
+            )
+        log_path.write_text("\n".join(lines) + "\n")
+        print(f"  [trt/profile] wrote {log_path}")
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # COCO mAP of the TensorRT engine
 # ---------------------------------------------------------------------------
 
@@ -245,6 +368,9 @@ def run_trt_stage(
     eval_limit: int,
     bench_iters: int,
     out_dir: Path,
+    profile_layers: bool = False,
+    profile_iters: int = 50,
+    profile_topk: int = 25,
 ) -> dict:
     """Build / benchmark / evaluate the INT8 engine (and FP16 baseline if given)."""
     postprocess = None
@@ -255,13 +381,21 @@ def run_trt_stage(
     summary: dict = {}
 
     int8_engine = out_dir / f"{qat_onnx.stem}_int8.engine"
-    build_engine(qat_onnx, int8_engine, int8=True, fp16=True)
+    if int8_engine.exists():
+        print(f"  [trt] reusing {int8_engine}")
+    else:
+        build_engine(qat_onnx, int8_engine, int8=True, fp16=True)
     int8_runner = TRTRunner(load_engine(int8_engine), device)
     summary["int8"] = {"engine": str(int8_engine)}
     summary["int8"]["latency"] = benchmark_engine(int8_runner, imgsz, device, iters=bench_iters)
     print(f"  [trt] INT8  latency: mean={summary['int8']['latency']['mean_ms']:.3f}ms "
           f"median={summary['int8']['latency']['median_ms']:.3f}ms "
           f"throughput={summary['int8']['latency']['throughput_fps']:.1f} fps")
+    if profile_layers:
+        summary["int8"]["profile"] = profile_engine_layers(
+            int8_runner, imgsz, device, iters=profile_iters, topk=profile_topk,
+            log_path=out_dir / "rfdetr_nano_int8_profile.csv",
+        )
     if postprocess is not None:
         summary["int8"]["accuracy"] = evaluate_engine_map(
             int8_runner, postprocess, VAL_DIR, ANN_FILE, device, imgsz, limit=eval_limit
@@ -269,13 +403,21 @@ def run_trt_stage(
 
     if fp32_onnx is not None and fp32_onnx.exists():
         fp16_engine = out_dir / f"{fp32_onnx.stem}_fp16.engine"
-        build_engine(fp32_onnx, fp16_engine, int8=False, fp16=True)
+        if fp16_engine.exists():
+            print(f"  [trt] reusing {fp16_engine}")
+        else:
+            build_engine(fp32_onnx, fp16_engine, int8=False, fp16=True)
         fp16_runner = TRTRunner(load_engine(fp16_engine), device)
         summary["fp16"] = {"engine": str(fp16_engine)}
         summary["fp16"]["latency"] = benchmark_engine(fp16_runner, imgsz, device, iters=bench_iters)
         print(f"  [trt] FP16  latency: mean={summary['fp16']['latency']['mean_ms']:.3f}ms "
               f"median={summary['fp16']['latency']['median_ms']:.3f}ms "
               f"throughput={summary['fp16']['latency']['throughput_fps']:.1f} fps")
+        if profile_layers:
+            summary["fp16"]["profile"] = profile_engine_layers(
+                fp16_runner, imgsz, device, iters=profile_iters, topk=profile_topk,
+                log_path=out_dir / "rfdetr_nano_fp16_profile.csv",
+            )
         if postprocess is not None:
             summary["fp16"]["accuracy"] = evaluate_engine_map(
                 fp16_runner, postprocess, VAL_DIR, ANN_FILE, device, imgsz, limit=eval_limit
@@ -298,6 +440,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--eval-limit", type=int, default=1500,
                    help="Cap mAP eval images (0 = full val2017, -1 = skip accuracy)")
     p.add_argument("--bench-iters", type=int, default=300)
+    p.add_argument("--profile-layers", action="store_true", help="Collect TensorRT per-layer timing summaries for each engine")
+    p.add_argument("--profile-iters", type=int, default=50, help="Profile iterations per engine")
+    p.add_argument("--profile-topk", type=int, default=25, help="Number of top layers to save in profile CSVs")
+    p.add_argument("--summary-name", default=None, help="Summary JSON filename. Default: trt_summary.json, or trt_profile_summary.json for profile-only runs")
     p.add_argument("--out-dir", type=Path, default=None, help="Engine output dir (default: alongside ONNX)")
     return p.parse_args(argv)
 
@@ -316,9 +462,14 @@ def main(argv: list[str] | None = None) -> int:
         args.qat_onnx, args.fp32_onnx,
         model=args.model, imgsz=args.imgsz, device=device,
         eval_limit=args.eval_limit, bench_iters=args.bench_iters, out_dir=out_dir,
+        profile_layers=args.profile_layers, profile_iters=args.profile_iters,
+        profile_topk=args.profile_topk,
     )
 
-    dst = out_dir / "trt_summary.json"
+    summary_name = args.summary_name
+    if summary_name is None:
+        summary_name = "trt_profile_summary.json" if args.profile_layers and args.eval_limit < 0 else "trt_summary.json"
+    dst = out_dir / summary_name
     dst.write_text(json.dumps(summary, indent=2))
     print(f"  [trt] wrote {dst}")
     return 0

@@ -18,6 +18,7 @@ RF-DETR using NVIDIA ModelOpt"* started 2026-05-18.
 | e2e pipeline | ✅ done | `main()` runs FP32 eval → PTQ → PTQ eval → QAT → QAT eval → ONNX, with stage skip/resume flags. |
 | ONNX export | ✅ validated | `rfdetr_nano_qat.onnx` exports at opset 17 with 192 Q/DQ pairs; `rfdetr_nano_fp32.onnx` exports as the FP16 TensorRT baseline input. |
 | TRT speedup measurement | ✅ done | `rfdetr_trt.py`: INT8 Q/DQ engine 2.304 ms / 433.9 fps / mAP 0.4929; FP16 baseline 2.324 ms / 430.3 fps / mAP 0.4999; speedup 1.01x. |
+| TRT profiling | ✅ grouped pass | Python TensorRT `IProfiler` support added to `rfdetr_trt.py`; profile-only runs write grouped totals plus top layers to `trt_profile_summary.json`, `rfdetr_nano_int8_profile.csv`, and `rfdetr_nano_fp16_profile.csv`. INT8 profile: MLP/linear 45.4%, MHA 10.6%, conv/projection 9.0%; FP16 profile: MLP/linear 36.8%, MHA 25.5%, conv/projection 7.2%. |
 
 ---
 
@@ -138,15 +139,20 @@ is accuracy-correct but only 1.01x faster in this configuration.
 
 ## Open questions / next steps
 
-1. **TensorRT profiling.** INT8 is only 1.01x faster than FP16; inspect the TRT
-   layer profile to identify whether deformable attention, transformer ops, or
-   FP32 fallback dominate runtime.
-2. **Supervised QAT.** Distillation recovers most of the PTQ gap; a supervised
+1. **Selective transformer quantization.** Initial TRT profiling shows broad INT8
+   is dominated by DINOv2 backbone MLP `fc1` MatMuls and fused MHA kernels, and
+   the INT8 MLP MatMuls are slower than the FP16 fused-FC path. Try policies
+   that leave attention/MLP blocks FP16 while quantizing only the patch/projector
+   convs, then compare latency and mAP.
+2. **Selective quantization policy sweep.** Now that grouped TRT profiling is in
+   place, implement ModelOpt exclusion policies for backbone MLP/attention blocks
+   versus patch/projector convs and compare latency, grouped profile, and mAP.
+3. **Supervised QAT.** Distillation recovers most of the PTQ gap; a supervised
    `SetCriterion` fine-tune (with Hungarian matching) is the next lever if more
    accuracy is needed — it would need COCO targets in DETR format.
-3. **Broader AO comparison.** The PyTorch AO RF-DETR script exists; run the same
+4. **Broader AO comparison.** The PyTorch AO RF-DETR script exists; run the same
    1500-image eval and TensorRT export path once an AO ONNX export is proven.
-4. **Repo layout.** If RF-DETR support grows, rename the top-level package from
+5. **Repo layout.** If RF-DETR support grows, rename the top-level package from
    `yolo_quantization/` to `model_quantization/` and split the workstreams.
 
 ---
