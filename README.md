@@ -71,7 +71,7 @@ are within statistical noise of their FP32 ONNX baselines.
 
 ## RF-DETR INT8 QAT
 
-RF-DETR support lives in [`rfdetr_quantization/`](rfdetr_quantization/). The ModelOpt path uses PTQ calibration plus backbone feature-map distillation QAT, keeping `class_embed` and `bbox_embed` heads FP32.
+RF-DETR support lives in [`rfdetr_quantization/`](rfdetr_quantization/). The ModelOpt path uses PTQ calibration plus backbone feature-map distillation QAT. It now also has named selective quantization policies (`--quant-policy`) so transformer-heavy blocks can stay FP16 while smaller INT8 islands are measured.
 
 ### Results — RF-DETR-nano on COCO `val2017`
 
@@ -89,12 +89,14 @@ ONNX export is validated for this checkpoint: `rfdetr_nano_qat.onnx` exports wit
 
 Measured with `rfdetr_quantization/rfdetr_trt.py` over 300 CUDA-event timing iterations. Accuracy is deployed-engine COCO mAP on the same first 1500 `val2017` images.
 
-| Engine | Mean latency | Median latency | Throughput | mAP50 | mAP50-95 | Speedup |
-|---|---:|---:|---:|---:|---:|---:|
-| FP32 ONNX built as FP16 | 2.324 ms | 2.271 ms | 430.3 fps | 0.6871 | 0.4999 | 1.00x |
-| QAT Q/DQ ONNX built as INT8 | **2.304 ms** | 2.300 ms | **433.9 fps** | 0.6786 | 0.4929 | **1.01x** |
+| Engine | Q/DQ pairs | Mean latency | Median latency | Throughput | mAP50 | mAP50-95 | Speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| FP32 ONNX built as FP16 | 0 | 2.324 ms | 2.271 ms | 430.3 fps | 0.6871 | 0.4999 | 1.00x |
+| Broad QAT Q/DQ ONNX built as INT8 | 192 | **2.304 ms** | 2.300 ms | **433.9 fps** | 0.6786 | 0.4929 | **1.01x** |
+| `conv-projector-only` PTQ Q/DQ ONNX built as INT8 | 18 | 2.340 ms | 2.319 ms | 427.3 fps | 0.6860 | 0.4987 | 0.98x |
+| `no-dino-mlp-attn` PTQ Q/DQ ONNX built as INT8 | 48 | 2.324 ms | 2.318 ms | 430.3 fps | 0.6861 | 0.4977 | 0.98x |
 
-The RF-DETR-nano TensorRT result is accuracy-correct but not materially faster than the FP16 baseline on this GPU. The exported graph still contains many non-quantized transformer/deformable-attention operations, so INT8 only improves a subset of the runtime path.
+The RF-DETR-nano TensorRT result is accuracy-correct but not materially faster than the FP16 baseline on this GPU. The selective INT8 runs keep accuracy close to FP16 but are slower, so the current evidence says naive or narrow INT8 Q/DQ is not the speed lever. Local TensorRT profiling and Roboflow RF-DETR issues point instead to transformer/attention fusion, TensorRT version, and compile/runtime backend work.
 
 ## Project Structure
 

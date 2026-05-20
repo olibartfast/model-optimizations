@@ -12,13 +12,14 @@ RF-DETR using NVIDIA ModelOpt"* started 2026-05-18.
 | Architecture scouting | ✅ done | LWDETR: backbone (DINOv2 ViT) + transformer + heads (`class_embed` Linear + `bbox_embed` MLP); 155 Linear, 54 LayerNorm, 9 Conv2d, 2 MultiheadAttention. |
 | Dependency conflict | ✅ resolved | `rfdetr` requires transformers≥5; modelopt's HF plugin used the removed `transformers.modeling_utils.Conv1D`. Patched the plugin to guard that registration (`quantization_venv/.../plugins/huggingface.py:209`). |
 | Calibration pipeline | ✅ working | Bypass rfdetr's val transforms (brittle on Albumentations 2.x); hand-built loader does cv2 square resize → /255 → ImageNet normalize → `NestedTensor`. RF-DETR resizes to a square by design, so this is the *correct* preprocessing. |
-| PTQ | ✅ working | `mtq.quantize` inserts ~498 `TensorQuantizer` modules; `*class_embed*` / `*bbox_embed*` heads excluded. |
+| PTQ | ✅ working | `mtq.quantize` inserts quantizers under named policies: `broad` (heads FP32), `no-dino-mlp-attn` (DINO attention/MLP FP16), and `conv-projector-only` (transformer + DINO blocks FP16). |
 | mAP evaluator | ✅ done | `evaluate_map` runs COCO `val2017` through the quantized model + `PostProcess` and scores via rfdetr's `CocoEvaluator` (raw COCO category ids, no remap). |
 | QAT distillation loop | ✅ done | FP32 teacher / INT8 student, **backbone feature-map distillation** (normalized MSE); Adam low/high/low ladder; per-epoch eval + best-checkpoint rollback. |
 | e2e pipeline | ✅ done | `main()` runs FP32 eval → PTQ → PTQ eval → QAT → QAT eval → ONNX, with stage skip/resume flags. |
 | ONNX export | ✅ validated | `rfdetr_nano_qat.onnx` exports at opset 17 with 192 Q/DQ pairs; `rfdetr_nano_fp32.onnx` exports as the FP16 TensorRT baseline input. |
 | TRT speedup measurement | ✅ done | `rfdetr_trt.py`: INT8 Q/DQ engine 2.304 ms / 433.9 fps / mAP 0.4929; FP16 baseline 2.324 ms / 430.3 fps / mAP 0.4999; speedup 1.01x. |
-| TRT profiling | ✅ grouped pass | Python TensorRT `IProfiler` support added to `rfdetr_trt.py`; profile-only runs write grouped totals plus top layers to `trt_profile_summary.json`, `rfdetr_nano_int8_profile.csv`, and `rfdetr_nano_fp16_profile.csv`. INT8 profile: MLP/linear 45.4%, MHA 10.6%, conv/projection 9.0%; FP16 profile: MLP/linear 36.8%, MHA 25.5%, conv/projection 7.2%. |
+| TRT profiling | ✅ grouped pass | Python TensorRT `IProfiler` support added to `rfdetr_trt.py`; grouped profile shows broad INT8 spends 45.4% in MLP/linear and only 9.0% in conv/projection. |
+| Selective policies | ✅ measured | `--quant-policy` + `--run-tag` allow non-overwriting sweeps. Accuracy holds for `conv-projector-only` (0.4984 AP) and `no-dino-mlp-attn` (0.4968 AP), but both TensorRT INT8 engines are slower than FP16 (~0.98x). |
 
 ---
 
@@ -85,6 +86,8 @@ Resume QAT from a saved PTQ checkpoint (skips calibration)::
       --qat-epochs 4 --qat-images 960
 
 Useful flags: `--eval-limit N` (cap eval images), `--skip-qat` (PTQ-only),
+`--quant-policy {broad,no-dino-mlp-attn,conv-projector-only}`, `--extra-excludes GLOB...`,
+`--run-tag NAME` (write `summary_NAME.json` and suffixed checkpoints/ONNX),
 `--qat-source {train,val}` (QAT image pool; `train` avoids the eval leak),
 `--qat-lr / --qat-low-lr`, `--qat-eval-every N`, `--no-export`,
 `--onnx-opset N` (default 17).
@@ -116,10 +119,18 @@ the transformer encoder memory (also position-aligned) is the next lever.
 
 Export/deployment status: ONNX export and TensorRT benchmarking are complete.
 The QAT checkpoint exports to `rfdetr_nano_qat.onnx` with 192 Q/DQ pairs, and
-TensorRT builds a 36.0 MB INT8 engine. On RTX 3060 Laptop GPU, INT8 latency is
-2.304 ms mean / 433.9 fps with deployed-engine mAP50-95 0.4929. The FP32 ONNX
+TensorRT builds a 36.0 MB INT8 engine. On RTX 3060 Laptop GPU, broad INT8 latency
+is 2.304 ms mean / 433.9 fps with deployed-engine mAP50-95 0.4929. The FP32 ONNX
 baseline built as FP16 is 2.324 ms / 430.3 fps with mAP50-95 0.4999, so RF-DETR
 is accuracy-correct but only 1.01x faster in this configuration.
+
+Selective PTQ policy results so far, all on the same 1500-image eval slice:
+
+| Policy | Q/DQ pairs | Torch PTQ mAP50-95 | TRT mAP50-95 | Mean latency | Speedup vs FP16 |
+|---|---:|---:|---:|---:|---:|
+| `broad` QAT | 192 | 0.4925 | 0.4929 | 2.304 ms | 1.01x |
+| `conv-projector-only` PTQ | 18 | 0.4984 | 0.4987 | 2.340 ms | 0.98x |
+| `no-dino-mlp-attn` PTQ | 48 | 0.4968 | 0.4977 | 2.324 ms | 0.98x |
 
 ---
 
@@ -132,6 +143,7 @@ is accuracy-correct but only 1.01x faster in this configuration.
 | Calibration data | COCO `val2017` | Reuses the existing dataset; calibration is statistics-only so leakage is mild. |
 | Preprocessing | cv2 square resize + ImageNet normalize | RF-DETR resizes inputs to a square by design; `PostProcess` rescales boxes by the original image size, undoing the distortion. |
 | Head exclusions | `*class_embed*`, `*bbox_embed*` | DETR analog of YOLO's DFL + Detect-output exclusion: the final-prediction Linears are accuracy-critical and kept FP32. |
+| Quantization policies | Named `--quant-policy` presets | Upstream RF-DETR issues and local TRT profiling both show full transformer INT8 has weak speedup. Policies let us leave DINO attention/MLP FP16 and measure smaller INT8 islands without overwriting baseline artifacts. |
 | Best-epoch rollback | Checkpoint the highest-mAP epoch | QAT can overshoot; the lowest-loss epoch is not always the highest-mAP one. |
 | Variant for first runs | `rfdetr-nano` (30.5M params, 384px) | Smallest, lowest VRAM, fastest iteration. |
 
@@ -139,21 +151,25 @@ is accuracy-correct but only 1.01x faster in this configuration.
 
 ## Open questions / next steps
 
-1. **Selective transformer quantization.** Initial TRT profiling shows broad INT8
-   is dominated by DINOv2 backbone MLP `fc1` MatMuls and fused MHA kernels, and
-   the INT8 MLP MatMuls are slower than the FP16 fused-FC path. Try policies
-   that leave attention/MLP blocks FP16 while quantizing only the patch/projector
-   convs, then compare latency and mAP.
-2. **Selective quantization policy sweep.** Now that grouped TRT profiling is in
-   place, implement ModelOpt exclusion policies for backbone MLP/attention blocks
-   versus patch/projector convs and compare latency, grouped profile, and mAP.
-3. **Supervised QAT.** Distillation recovers most of the PTQ gap; a supervised
-   `SetCriterion` fine-tune (with Hungarian matching) is the next lever if more
-   accuracy is needed — it would need COCO targets in DETR format.
-4. **Broader AO comparison.** The PyTorch AO RF-DETR script exists; run the same
-   1500-image eval and TensorRT export path once an AO ONNX export is proven.
-5. **Repo layout.** If RF-DETR support grows, rename the top-level package from
-   `yolo_quantization/` to `model_quantization/` and split the workstreams.
+1. **Selective INT8 sweep is complete.** Both `conv-projector-only` and `no-dino-mlp-attn` preserve accuracy but are slower than FP16; do not spend more time broadening Q/DQ coverage unless the runtime path changes.
+2. **Prioritize runtime/fusion work over broader INT8.** Local profiles and Roboflow issues point to TensorRT version, MHA fusion, attention implementation, and `torch.compile`/TensorRT backend as the realistic speed levers.
+3. **Supervised QAT.** Distillation recovers most of the PTQ gap; a supervised `SetCriterion` fine-tune (with Hungarian matching) is the next lever if more accuracy is needed.
+4. **Broader AO comparison.** The PyTorch AO RF-DETR script exists; run the same 1500-image eval and TensorRT export path once an AO ONNX export is proven.
+5. **Repo layout.** If RF-DETR support grows, rename the top-level package from `yolo_quantization/` to `model_quantization/` and split the workstreams.
+
+---
+
+## Roboflow RF-DETR issue scan
+
+Searched `roboflow/rf-detr` with `gh` for quantization, TensorRT, ONNX, latency, and speed issues. Relevant findings:
+
+- #504 `Quantization-Aware Training` is open; maintainer notes INT8 attention needs special consideration and deployment environment matters.
+- #566 `INT8 Optimization Slower Than FP32 on RTX A4000` was closed with guidance that ONNX Runtime CUDA is inefficient for transformer models; use TensorRT FP16 on Linux, and uncalibrated INT8 can regress.
+- #955 `Latency on Jetson Thor (fp16/fp8/int8)` reports little meaningful INT8/FP8 speedup; comments point at backbone ViT/attention behavior, TensorRT version, and max-power benchmarking mode.
+- #703 clarifies older explicit TensorRT plugin wiring is dead code in current RF-DETR; discussion says `torch.compile` and TensorRT backends can be competitive once dynamic-shape graph breaks are patched.
+- #649 confirms official RF-DETR `.export()` plus the single-artifact benchmarking path is the expected TensorRT route for accuracy-correct FP16 deployment.
+
+Takeaway: the weak broad-INT8 speedup is not just our pipeline. For RF-DETR, accuracy-preserving INT8 Q/DQ is feasible, but speedup requires the runtime to actually fuse/accelerate transformer attention and MLP work. The roadmap should treat selective quantization as a measurement tool and prioritize TensorRT/compile/attention runtime paths for real latency gains.
 
 ---
 

@@ -72,6 +72,19 @@ RFDETR_VARIANTS = {
 # Default head modules to skip during INT8 quantization. Pattern matches
 # any quantizer attached to a module whose full path contains the glob.
 DEFAULT_HEAD_EXCLUDES = ("*class_embed*", "*bbox_embed*")
+QUANT_POLICIES = {
+    "broad": DEFAULT_HEAD_EXCLUDES,
+    "no-dino-mlp-attn": (
+        *DEFAULT_HEAD_EXCLUDES,
+        "*backbone.0.encoder.encoder.encoder.layer.*.attention*",
+        "*backbone.0.encoder.encoder.encoder.layer.*.mlp*",
+    ),
+    "conv-projector-only": (
+        *DEFAULT_HEAD_EXCLUDES,
+        "*transformer*",
+        "*backbone.0.encoder.encoder.encoder.layer.*",
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -158,9 +171,17 @@ def build_calib_batches(
 # PTQ
 # ---------------------------------------------------------------------------
 
-def build_quant_cfg(mtq, head_excludes: tuple[str, ...] = DEFAULT_HEAD_EXCLUDES) -> dict:
+def resolve_quant_excludes(policy: str, extra_excludes: tuple[str, ...] = ()) -> tuple[str, ...]:
+    if policy not in QUANT_POLICIES:
+        raise ValueError(f"unknown quant policy {policy!r}; choices={sorted(QUANT_POLICIES)}")
+    excludes = list(QUANT_POLICIES[policy])
+    excludes.extend(extra_excludes)
+    return tuple(dict.fromkeys(excludes))
+
+
+def build_quant_cfg(mtq, excludes: tuple[str, ...] = DEFAULT_HEAD_EXCLUDES) -> dict:
     cfg = copy.deepcopy(mtq.INT8_DEFAULT_CFG)
-    for glob in head_excludes:
+    for glob in excludes:
         cfg["quant_cfg"][glob] = {"enable": False}
     return cfg
 
@@ -181,13 +202,13 @@ def run_ptq(
     model: torch.nn.Module,
     calib_batches: list,
     device: torch.device,
-    head_excludes: tuple[str, ...] = DEFAULT_HEAD_EXCLUDES,
+    excludes: tuple[str, ...] = DEFAULT_HEAD_EXCLUDES,
 ):
     import modelopt.torch.quantization as mtq
     from modelopt.torch.quantization.nn import TensorQuantizer
 
-    quant_cfg = build_quant_cfg(mtq, head_excludes)
-    print(f"  [ptq] head exclusions: {list(head_excludes)}")
+    quant_cfg = build_quant_cfg(mtq, excludes)
+    print(f"  [ptq] quantizer exclusions: {list(excludes)}")
     mtq.quantize(model, quant_cfg, calibrate_factory(calib_batches, device))
     n_q = sum(1 for _ in model.modules() if isinstance(_, TensorQuantizer))
     print(f"  [ptq] inserted {n_q} TensorQuantizer modules")
@@ -541,10 +562,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # PTQ
     p.add_argument("--calib-size", type=int, default=256, help="# val2017 images for PTQ calibration")
-    p.add_argument(
-        "--head-excludes", nargs="+", default=list(DEFAULT_HEAD_EXCLUDES), metavar="GLOB",
-        help="Module-path globs to keep FP32 (default: class/bbox heads)",
-    )
+    p.add_argument("--quant-policy", choices=sorted(QUANT_POLICIES), default="broad",
+                   help="Named quantization policy. broad keeps only final heads FP32; "
+                        "no-dino-mlp-attn leaves DINOv2 MLP/attention FP16; "
+                        "conv-projector-only leaves transformer and DINO blocks FP16.")
+    p.add_argument("--extra-excludes", nargs="+", default=[], metavar="GLOB",
+                   help="Additional module-path globs to keep FP32 on top of --quant-policy")
+    p.add_argument("--run-tag", default="", help="Optional suffix for outputs so policy sweeps do not overwrite baseline files")
     p.add_argument("--from-ptq", type=Path, default=None, help="Restore a saved *_ptq.pth and skip calibration")
 
     # Eval
@@ -595,11 +619,15 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = OUT_ROOT / args.model.replace("-", "_")
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = args.model.replace("-", "_")
+    file_tag = f"{tag}_{args.run_tag}" if args.run_tag else tag
+    quant_excludes = resolve_quant_excludes(args.quant_policy, tuple(args.extra_excludes))
     summary: dict = {
         "model": args.model,
         "resolution": imgsz,
         "calib_size": args.calib_size,
-        "head_excludes": list(args.head_excludes),
+        "quant_policy": args.quant_policy,
+        "quant_excludes": list(quant_excludes),
+        "run_tag": args.run_tag,
         "eval_limit": args.eval_limit,
     }
 
@@ -631,11 +659,11 @@ def main(argv: list[str] | None = None) -> int:
             VAL_DIR, imgsz, args.batch, args.calib_size, seed=args.seed, label="calib"
         )
         t0 = time.time()
-        run_ptq(model, calib_batches, device, head_excludes=tuple(args.head_excludes))
+        run_ptq(model, calib_batches, device, excludes=quant_excludes)
         print(f"  [ptq] elapsed {time.time() - t0:.1f}s")
         del calib_batches
 
-    ptq_ckpt = out_dir / f"{tag}_ptq.pth"
+    ptq_ckpt = out_dir / f"{file_tag}_ptq.pth"
     mto.save(model, str(ptq_ckpt))
     print(f"  [ptq] saved {ptq_ckpt} ({ptq_ckpt.stat().st_size/1e6:.1f} MB)")
     summary["ptq_checkpoint"] = str(ptq_ckpt)
@@ -693,7 +721,7 @@ def main(argv: list[str] | None = None) -> int:
             summary["qat"] = best["metrics"]
             summary["qat_best_epoch"] = best["epoch"]
 
-        qat_ckpt = out_dir / f"{tag}_qat.pth"
+        qat_ckpt = out_dir / f"{file_tag}_qat.pth"
         mto.save(model, str(qat_ckpt))
         print(f"  [qat] saved {qat_ckpt} ({qat_ckpt.stat().st_size/1e6:.1f} MB)")
         summary["qat_checkpoint"] = str(qat_ckpt)
@@ -714,13 +742,14 @@ def main(argv: list[str] | None = None) -> int:
     # --- Stage 6: ONNX export ----------------------------------------------
     if not args.no_export:
         suffix = "ptq" if args.skip_qat else "qat"
-        onnx_dst = out_dir / f"{tag}_{suffix}.onnx"
+        onnx_dst = out_dir / f"{file_tag}_{suffix}.onnx"
         export_onnx(model, imgsz, device, onnx_dst, opset=args.onnx_opset)
         if onnx_dst.exists():
             summary["onnx"] = str(onnx_dst)
 
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-    print(f"  [done] {out_dir/'summary.json'}")
+    summary_path = out_dir / (f"summary_{args.run_tag}.json" if args.run_tag else "summary.json")
+    summary_path.write_text(json.dumps(summary, indent=2))
+    print(f"  [done] {summary_path}")
 
     # Compact stage comparison
     def _fmt(key):
