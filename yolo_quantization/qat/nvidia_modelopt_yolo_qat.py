@@ -1165,6 +1165,7 @@ def run_distillation_qat(
     log_every: int = 0,
     eval_callback=None,
     eval_every: int = 0,
+    quant_state_snapshot_fn=None,
 ) -> list[dict]:
     """QAT loop combining COCO supervised detection loss with teacher-student MSE.
 
@@ -1231,7 +1232,8 @@ def run_distillation_qat(
 
     use_supervised = supervised_weight > 0.0
     use_distill = distill_weight > 0.0
-    initial_amax = _snapshot_amax_state(student_model)
+    snapshot_quant_state = quant_state_snapshot_fn or _snapshot_amax_state
+    initial_amax = snapshot_quant_state(student_model)
     if initial_amax:
         print(f"  [qat] tracking amax drift across {len(initial_amax)} quantizer(s)")
 
@@ -1314,7 +1316,7 @@ def run_distillation_qat(
         avg_cls = running_cls / denom
         avg_dfl = running_dfl / denom
         epoch_secs = time.time() - epoch_t0
-        drift = _amax_drift_stats(initial_amax, _snapshot_amax_state(student_model))
+        drift = _amax_drift_stats(initial_amax, snapshot_quant_state(student_model))
         total = supervised_weight * avg_s + distill_weight * avg_d
         row: dict = {
             "epoch": epoch + 1,

@@ -4,7 +4,8 @@ Experimental PyTorch AO fake-quant QAT recipe for Ultralytics YOLO.
 
 This is an alternative research path to the NVIDIA ModelOpt pipeline in
 ``nvidia_modelopt_yolo_qat.py``. It uses ``torch.ao.quantization`` observers and
-``FakeQuantize`` modules directly around YOLO ``nn.Conv2d`` layers:
+``FakeQuantize`` modules directly around YOLO ``nn.Conv2d`` layer inputs,
+weights, and outputs:
 
 1. Load an FP32 Ultralytics checkpoint.
 2. Optionally evaluate FP32 mAP.
@@ -60,8 +61,10 @@ AO_QAT_RECIPES: dict[str, dict[str, Any]] = {
         "qat_distill_weight": 1.0,
         "qat_supervised_weight": 1.0,
         "calib_size": 260,
+        "ao_activation_observer": "histogram",
         "exclude_dfl_quant": False,
         "disable_detect_output_quant": False,
+        "disable_conv_output_quant": True,
     },
     "yolo11-ao-distill": {
         "qat_epochs": 10,
@@ -71,8 +74,10 @@ AO_QAT_RECIPES: dict[str, dict[str, Any]] = {
         "qat_distill_weight": 1.0,
         "qat_supervised_weight": 1.0,
         "calib_size": 1024,
+        "ao_activation_observer": "moving_average_minmax",
         "exclude_dfl_quant": True,
         "disable_detect_output_quant": True,
+        "disable_conv_output_quant": False,
     },
 }
 
@@ -97,8 +102,10 @@ def _apply_ao_recipe(args, explicit_flags: set[str]) -> str:
         "qat_distill_weight": "--qat-distill-weight",
         "qat_supervised_weight": "--qat-supervised-weight",
         "calib_size": "--calib-size",
+        "ao_activation_observer": "--ao-activation-observer",
         "exclude_dfl_quant": "--exclude-dfl-quant",
         "disable_detect_output_quant": "--disable-detect-output-quant",
+        "disable_conv_output_quant": "--disable-conv-output-quant",
     }
     applied: list[str] = []
     for key, value in AO_QAT_RECIPES[resolved].items():
@@ -112,7 +119,7 @@ def _apply_ao_recipe(args, explicit_flags: set[str]) -> str:
 
 
 class AOConv2dQATWrapper(torch.nn.Module):
-    """Conv2d wrapper using PyTorch AO fake quant for activation and weight."""
+    """Conv2d wrapper using PyTorch AO fake quant for activation, weight, and output."""
 
     def __init__(
         self,
@@ -120,18 +127,27 @@ class AOConv2dQATWrapper(torch.nn.Module):
         *,
         activation_quant: bool = True,
         weight_quant: bool = True,
+        output_quant: bool = True,
+        activation_observer: str = "moving_average_minmax",
     ) -> None:
         super().__init__()
         from torch.ao.quantization import (
             FakeQuantize,
+            HistogramObserver,
             MovingAverageMinMaxObserver,
             MovingAveragePerChannelMinMaxObserver,
         )
 
+        activation_observer_cls = {
+            "moving_average_minmax": MovingAverageMinMaxObserver,
+            "histogram": HistogramObserver,
+        }[activation_observer]
+
         self.conv = conv
+        self.activation_observer = activation_observer
         self.activation_fake_quant = (
             FakeQuantize(
-                observer=MovingAverageMinMaxObserver,
+                observer=activation_observer_cls,
                 quant_min=0,
                 quant_max=255,
                 dtype=torch.quint8,
@@ -153,11 +169,23 @@ class AOConv2dQATWrapper(torch.nn.Module):
             if weight_quant
             else torch.nn.Identity()
         )
+        self.output_fake_quant = (
+            FakeQuantize(
+                observer=activation_observer_cls,
+                quant_min=0,
+                quant_max=255,
+                dtype=torch.quint8,
+                qscheme=torch.per_tensor_affine,
+                reduce_range=False,
+            )
+            if output_quant
+            else torch.nn.Identity()
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.activation_fake_quant(x)
         weight = self.weight_fake_quant(self.conv.weight)
-        return torch.nn.functional.conv2d(
+        y = torch.nn.functional.conv2d(
             x,
             weight,
             self.conv.bias,
@@ -166,6 +194,7 @@ class AOConv2dQATWrapper(torch.nn.Module):
             self.conv.dilation,
             self.conv.groups,
         )
+        return self.output_fake_quant(y)
 
 
 def _is_under_prefix(name: str, prefixes: list[str]) -> bool:
@@ -182,15 +211,27 @@ def prepare_pytorch_ao_fake_quant(
     model: torch.nn.Module,
     *,
     exclude_prefixes: list[str] | None = None,
+    disable_output_quant_prefixes: list[str] | None = None,
+    activation_observer: str = "moving_average_minmax",
 ) -> int:
     """Wrap Conv2d modules with AO fake quant, excluding requested module prefixes."""
     exclude_prefixes = exclude_prefixes or []
+    disable_output_quant_prefixes = disable_output_quant_prefixes or []
     replacements: list[tuple[str, AOConv2dQATWrapper]] = []
     for name, module in model.named_modules():
         if not name or _is_under_prefix(name, exclude_prefixes):
             continue
         if isinstance(module, torch.nn.Conv2d):
-            replacements.append((name, AOConv2dQATWrapper(module)))
+            replacements.append(
+                (
+                    name,
+                    AOConv2dQATWrapper(
+                        module,
+                        output_quant=not _is_under_prefix(name, disable_output_quant_prefixes),
+                        activation_observer=activation_observer,
+                    ),
+                )
+            )
     for name, wrapper in replacements:
         _replace_child_module(model, name, wrapper)
     return len(replacements)
@@ -236,6 +277,26 @@ def snapshot_ao_qparams(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return snapshot
 
 
+def restore_student_requires_grad(model: torch.nn.Module) -> int:
+    """Undo Ultralytics validation side effects that mark student params non-trainable."""
+    restored = 0
+    for param in model.parameters():
+        if not param.requires_grad:
+            param.requires_grad_(True)
+            restored += 1
+    return restored
+
+
+def normalize_ultralytics_model_args(model: torch.nn.Module, imgsz: int) -> None:
+    """Keep ``YOLO.export()`` compatible after trainer code replaces args with a namespace."""
+    args = getattr(model, "args", None)
+    if args is None:
+        model.args = {"imgsz": imgsz}
+    elif not isinstance(args, dict):
+        model.args = vars(args).copy()
+    model.args.setdefault("imgsz", imgsz)
+
+
 def calibrate_ao_fake_quant_model(
     model: torch.nn.Module,
     calib_dir: Path,
@@ -275,7 +336,7 @@ class AOModelResult:
 def _save_ao_checkpoint(path: Path, model: torch.nn.Module, config: dict[str, Any]) -> None:
     torch.save(
         {
-            "format": "pytorch_ao_fake_quant_yolo_qat_v1",
+            "format": "pytorch_ao_fake_quant_yolo_qat_v2",
             "model_state_dict": model.state_dict(),
             "config": copy.deepcopy(config),
         },
@@ -283,10 +344,33 @@ def _save_ao_checkpoint(path: Path, model: torch.nn.Module, config: dict[str, An
     )
 
 
+def _load_ao_state_dict(model: torch.nn.Module, state_dict: dict[str, Any]) -> None:
+    try:
+        model.load_state_dict(state_dict)
+        return
+    except RuntimeError:
+        incompatible = model.load_state_dict(state_dict, strict=False)
+
+    allowed_missing = all(".output_fake_quant." in key for key in incompatible.missing_keys)
+    if allowed_missing and not incompatible.unexpected_keys:
+        print(
+            "  [ao/ptq] restored legacy checkpoint without Conv output fake-quant state; "
+            "new output observers will recalibrate from defaults"
+        )
+        return
+
+    missing = ", ".join(incompatible.missing_keys[:8])
+    unexpected = ", ".join(incompatible.unexpected_keys[:8])
+    raise RuntimeError(
+        "AO checkpoint is incompatible with the prepared wrapper structure "
+        f"(missing=[{missing}], unexpected=[{unexpected}])"
+    )
+
+
 def _load_ao_checkpoint(path: Path, model: torch.nn.Module, device: torch.device) -> dict[str, Any]:
     obj = torch.load(path, map_location=str(device), weights_only=False)
     state_dict = obj["model_state_dict"] if isinstance(obj, dict) and "model_state_dict" in obj else obj
-    model.load_state_dict(state_dict)
+    _load_ao_state_dict(model, state_dict)
     return obj if isinstance(obj, dict) else {}
 
 
@@ -333,6 +417,8 @@ def run_ao_qat_for_model(
     freeze_student_bn: bool,
     exclude_dfl_quant: bool,
     disable_detect_output_quant: bool,
+    disable_conv_output_quant: bool,
+    ao_activation_observer: str,
     keep_fp32_modules: list[str] | None,
     recipe: str,
     seed: int | None,
@@ -368,16 +454,29 @@ def run_ao_qat_for_model(
     exclude_prefixes = list(keep_fp32_modules or [])
     if exclude_dfl_quant:
         exclude_prefixes.extend(find_dfl_module_paths(yolo.model))
-    if disable_detect_output_quant:
-        exclude_prefixes.extend(
+    if disable_conv_output_quant:
+        disable_output_quant_prefixes = [
+            name for name, module in yolo.model.named_modules() if isinstance(module, torch.nn.Conv2d)
+        ]
+    elif disable_detect_output_quant:
+        disable_output_quant_prefixes = [
             name for name, module in yolo.model.named_modules() if isinstance(module, Detect)
-        )
+        ]
+    else:
+        disable_output_quant_prefixes = []
 
-    wrapped = prepare_pytorch_ao_fake_quant(yolo.model, exclude_prefixes=exclude_prefixes)
+    wrapped = prepare_pytorch_ao_fake_quant(
+        yolo.model,
+        exclude_prefixes=exclude_prefixes,
+        disable_output_quant_prefixes=disable_output_quant_prefixes,
+        activation_observer=ao_activation_observer,
+    )
     yolo.model.to(torch_device)
     print(f"  [ao/prepare] wrapped {wrapped} Conv2d module(s)")
     if exclude_prefixes:
         print(f"  [ao/prepare] excluded prefixes: {exclude_prefixes}")
+    if disable_output_quant_prefixes:
+        print(f"  [ao/prepare] disabled Conv output fake quant under: {disable_output_quant_prefixes}")
 
     config_snapshot = {
         "seed": seed,
@@ -400,7 +499,10 @@ def run_ao_qat_for_model(
         "val_batch": val_batch,
         "exclude_dfl_quant": exclude_dfl_quant,
         "disable_detect_output_quant": disable_detect_output_quant,
+        "disable_conv_output_quant": disable_conv_output_quant,
+        "ao_activation_observer": ao_activation_observer,
         "keep_fp32_modules": keep_fp32_modules or [],
+        "disable_output_quant_prefixes": disable_output_quant_prefixes,
         "ao_wrapped_convs": wrapped,
         "recipe": recipe,
         "freeze_teacher_bn": freeze_teacher_bn,
@@ -450,6 +552,9 @@ def run_ao_qat_for_model(
             return None
         finally:
             yolo.model.train()
+            restored = restore_student_requires_grad(yolo.model)
+            if restored:
+                print(f"  [ao/qat/eval] restored requires_grad on {restored} student parameter(s)")
         print(
             f"  [ao/qat/eval] epoch {epoch_1based} mAP50={map50:.4f} "
             f"mAP50-95={mAP:.4f} ({secs:.1f}s)"
@@ -486,6 +591,7 @@ def run_ao_qat_for_model(
             log_every=qat_log_every,
             eval_callback=_qat_eval_callback if qat_eval_every > 0 else None,
             eval_every=qat_eval_every,
+            quant_state_snapshot_fn=snapshot_ao_qparams,
         )
         qat_ckpt = model_dir / f"{model_name}_ao_qat.pth"
         _save_ao_checkpoint(qat_ckpt, yolo.model, config_snapshot)
@@ -505,6 +611,7 @@ def run_ao_qat_for_model(
 
     onnx_path: Path | None = None
     if do_export and qat_stage.error is None:
+        normalize_ultralytics_model_args(yolo.model, imgsz)
         onnx_path = export_onnx(
             yolo,
             imgsz,
@@ -575,6 +682,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--qat-supervised-weight", type=float, default=1.0)
     p.add_argument("--qat-log-every", type=int, default=0)
     p.add_argument("--qat-eval-every", type=int, default=0)
+    p.add_argument(
+        "--ao-activation-observer",
+        choices=("moving_average_minmax", "histogram"),
+        default="moving_average_minmax",
+        help="Observer used for AO Conv input/output fake quant. Weight quant stays per-channel moving-average min/max.",
+    )
     p.add_argument("--skip-fp32-eval", action="store_true")
     p.add_argument("--skip-ptq-eval", action="store_true")
     p.add_argument("--skip-qat-eval", action="store_true")
@@ -583,7 +696,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--disable-detect-output-quant",
         action="store_true",
-        help="Keep every Ultralytics Detect-head Conv2d in FP for the AO fake-quant pass.",
+        help="Disable AO Conv output fake quant under Ultralytics Detect heads while keeping their input/weight fake quant enabled.",
+    )
+    p.add_argument(
+        "--disable-conv-output-quant",
+        action="store_true",
+        help="Disable AO Conv output fake quant on every Conv2d (input/weight fake quant stay enabled). Ablation switch.",
     )
     p.add_argument("--keep-fp32-modules", nargs="+", default=[], metavar="MODULE")
     p.add_argument("--freeze-teacher-bn", action=argparse.BooleanOptionalAction, default=None)
@@ -651,6 +769,8 @@ def main(argv: list[str] | None = None) -> int:
                     freeze_student_bn=args.freeze_student_bn,
                     exclude_dfl_quant=args.exclude_dfl_quant,
                     disable_detect_output_quant=args.disable_detect_output_quant,
+                    disable_conv_output_quant=args.disable_conv_output_quant,
+                    ao_activation_observer=args.ao_activation_observer,
                     keep_fp32_modules=args.keep_fp32_modules or None,
                     recipe=resolved_recipe,
                     seed=args.seed,

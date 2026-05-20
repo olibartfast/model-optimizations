@@ -167,7 +167,10 @@ hurts it.
   `FakeQuantize` around YOLO `Conv2d` layers. It is intended for YOLO11/YOLO26
   recipe comparisons against ModelOpt, saves under `runs/pytorch_ao_qat/`, and
   should not replace the canonical ModelOpt INT8 pipeline until export and
-  TensorRT deployability are validated.
+  TensorRT deployability are validated. For `yolo26-ao-distill`, `auto` now
+  disables Conv output fake-quant and uses histogram activation observers by
+  default because the full yolo26s ablations improved QAT from 0.4495 to
+  0.4654 mAP50-95 while still trailing same-split ModelOpt PTQ at 0.4708.
 
 ---
 
