@@ -205,9 +205,12 @@ bench_one() {
 # Reset CSV
 echo "engine,mean_ms,median_ms,throughput_qps" > "$OUT_DIR/speedup.csv"
 
-# Build + bench. FP32 baseline forced via --noTF32 so any speedup we report
-# is purely INT8 vs strict-FP32, not INT8 vs Ampere TF32.
+# Build + bench three engines from the same ONNX pair:
+#   fp32     — FP32 math forced via --noTF32 (strict baseline, not Ampere TF32).
+#   fp16     — the realistic deployment baseline; INT8 must beat *this* to be worth it.
+#   qat_int8 — INT8 with --fp16 fallback for non-quantized layers.
 bench_one "fp32"     "$FP32_ONNX" "--noTF32"
+bench_one "fp16"     "$FP32_ONNX" "--fp16"
 bench_one "qat_int8" "$QAT_ONNX"  "--int8 --fp16"
 
 # ---- Speedup summary ------------------------------------------------------
@@ -217,24 +220,32 @@ echo "=== Speedup summary ($STEM @ imgsz=$IMGSZ batch=$BATCH) ==="
 import csv
 rows = list(csv.DictReader(open("$OUT_DIR/speedup.csv")))
 data = {r["engine"]: r for r in rows}
+def f(x):
+    try: return float(x)
+    except: return float("nan")
 if "fp32" in data and "qat_int8" in data:
-    fp = data["fp32"]; q = data["qat_int8"]
-    def f(x):
-        try: return float(x)
-        except: return float("nan")
-    mean_fp, mean_q = f(fp["mean_ms"]), f(q["mean_ms"])
-    qps_fp, qps_q = f(fp["throughput_qps"]), f(q["throughput_qps"])
+    order = [e for e in ("fp32", "fp16", "qat_int8") if e in data]
     print(f"  {'engine':<10} {'mean_ms':>10} {'qps':>10}")
-    print(f"  {'fp32':<10} {mean_fp:>10.3f} {qps_fp:>10.1f}")
-    print(f"  {'qat_int8':<10} {mean_q:>10.3f} {qps_q:>10.1f}")
+    for e in order:
+        print(f"  {e:<10} {f(data[e]['mean_ms']):>10.3f} {f(data[e]['throughput_qps']):>10.1f}")
+    mean_fp, mean_q = f(data['fp32']['mean_ms']), f(data['qat_int8']['mean_ms'])
+    qps_fp, qps_q = f(data['fp32']['throughput_qps']), f(data['qat_int8']['throughput_qps'])
     if mean_fp and mean_q:
-        print(f"  speedup (mean latency): {mean_fp / mean_q:.2f}x")
+        print(f"  INT8 speedup vs FP32 (mean latency): {mean_fp / mean_q:.2f}x")
     if qps_fp and qps_q:
-        print(f"  speedup (throughput):   {qps_q / qps_fp:.2f}x")
+        print(f"  INT8 speedup vs FP32 (throughput):   {qps_q / qps_fp:.2f}x")
+    # FP16 is the realistic production baseline — this is the speedup that
+    # actually decides whether INT8 quantization is worth the accuracy cost.
+    if "fp16" in data:
+        mean_h, qps_h = f(data['fp16']['mean_ms']), f(data['fp16']['throughput_qps'])
+        if mean_h and mean_q:
+            print(f"  INT8 speedup vs FP16 (mean latency): {mean_h / mean_q:.2f}x  <-- the one that matters")
+        if qps_h and qps_q:
+            print(f"  INT8 speedup vs FP16 (throughput):   {qps_q / qps_h:.2f}x")
 PY
 
 if [ "$KEEP_ENGINES" -ne 1 ]; then
-    rm -f "$OUT_DIR/${STEM}_fp32.plan" "$OUT_DIR/${STEM}_qat_int8.plan"
+    rm -f "$OUT_DIR/${STEM}_fp32.plan" "$OUT_DIR/${STEM}_fp16.plan" "$OUT_DIR/${STEM}_qat_int8.plan"
 fi
 echo
 echo "CSV: $OUT_DIR/speedup.csv"

@@ -3,7 +3,9 @@
 #
 # Builds a TensorRT engine in INT8 mode (with --fp16 fallback for non-quantized
 # layers) and prints throughput / latency. Optional --fp32-onnx points at a
-# floating-point baseline so the two are reported side-by-side.
+# floating-point baseline, which is then benched in both FP32 and FP16 so all
+# three (FP32, FP16, INT8) are reported side-by-side. FP16 is the realistic
+# production baseline INT8 must beat to be worth the accuracy loss.
 #
 # Usage:
 #   ./scripts/bench_trt.sh runs/modelopt_qat/yolo26s/yolo26s_qat.onnx
@@ -98,7 +100,7 @@ bench_one() {
     local engine_dir
     engine_dir="${ENGINE_DIR:-$(dirname "$onnx_path")}"
     mkdir -p "$engine_dir"
-    local engine="$engine_dir/$(basename "${onnx_path%.onnx}").plan"
+    local engine="$engine_dir/$(basename "${onnx_path%.onnx}").$label.plan"
     local shape="images:${BATCH}x3x${IMGSZ}x${IMGSZ}"
 
     echo
@@ -119,7 +121,10 @@ bench_one() {
 
 bench_one "qat-int8" "$QAT_ONNX" "--int8 --fp16"
 if [ -n "$FP32_ONNX" ]; then
-    bench_one "fp32"     "$FP32_ONNX" ""
+    bench_one "fp32" "$FP32_ONNX" ""
+    # FP16 baseline: the realistic production deployment. INT8 has to beat
+    # FP16 (not just FP32) to justify the accuracy loss from quantization.
+    bench_one "fp16" "$FP32_ONNX" "--fp16"
 fi
 
 echo
