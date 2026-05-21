@@ -132,6 +132,35 @@ Selective PTQ policy results so far, all on the same 1500-image eval slice:
 | `conv-projector-only` PTQ | 18 | 0.4984 | 0.4987 | 2.340 ms | 0.98x |
 | `no-dino-mlp-attn` PTQ | 48 | 0.4968 | 0.4977 | 2.324 ms | 0.98x |
 
+### Batch sweep — the "no speedup" was a static-batch-1 artifact
+
+The 0.98–1.01x figures above are all **static batch-1** engines. That is the
+worst-case operating point: rfdetr-nano's transformer GEMMs are tiny, so at
+batch 1 they are memory/launch-bound and the explicit Q/DQ reformat tax swamps
+the INT8 GEMM saving. `rfdetr_batch_sweep.py` re-exports both ONNX with a
+dynamic batch axis, builds dynamic-shape engines (profile min1/opt8/max32), and
+benchmarks a batch sweep. INT8 wins as soon as the GEMMs are compute-bound:
+
+| Batch | INT8 ms/img | FP16 ms/img | INT8 fps | FP16 fps | Speedup |
+|---:|---:|---:|---:|---:|---:|
+| 1  | 2.554 | 3.336 | 392 | 300 | 1.31x |
+| 4  | 1.582 | 1.894 | 632 | 528 | 1.20x |
+| 8  | 1.430 | 1.764 | 700 | 567 | 1.23x |
+| 16 | 1.424 | 1.777 | 702 | 563 | 1.25x |
+| 32 | 1.421 | 1.761 | 704 | 568 | 1.24x |
+
+In the compute-bound regime (batch >= 8) INT8 is a stable **~1.24x** faster
+(704 vs 568 fps). The INT8 quantization pipeline is correct — it *does*
+accelerate; the earlier "no speedup" result was purely the batch-1 corner.
+Caveat: the batch-1 row (1.31x) is not a fair batch-1 claim — both dynamic
+engines are tactic-tuned for opt=8, so the dynamic FP16 engine is mistuned at
+batch 1 (3.34 ms vs the 2.32 ms a *static* batch-1 FP16 engine gets). The fair
+batch-1 comparison stays the static ~0.85–1.0x; what the sweep newly proves is
+every batch >= 4. Latency-only; mAP unchanged (same 192-Q/DQ graph, 0.4929).
+
+Artifacts: `runs/modelopt_qat/rfdetr_nano/batch_sweep_summary.json`,
+`rfdetr_nano_{int8,fp16}_dyn.engine`, `rfdetr_nano_{qat,fp32}_dyn.onnx`.
+
 ---
 
 ## Design decisions
@@ -151,8 +180,8 @@ Selective PTQ policy results so far, all on the same 1500-image eval slice:
 
 ## Open questions / next steps
 
-1. **Selective INT8 sweep is complete.** Both `conv-projector-only` and `no-dino-mlp-attn` preserve accuracy but are slower than FP16; do not spend more time broadening Q/DQ coverage unless the runtime path changes.
-2. **Prioritize runtime/fusion work over broader INT8.** Local profiles and Roboflow issues point to TensorRT version, MHA fusion, attention implementation, and `torch.compile`/TensorRT backend as the realistic speed levers.
+1. **INT8 speedup is real once compute-bound.** The batch sweep settles the "no speedup" question: broad INT8 is ~1.24x faster than FP16 at batch >= 8 (704 vs 568 fps). The 0.98–1.01x figures were a static-batch-1 artifact. Next: re-eval mAP on the dynamic INT8 engine to confirm accuracy holds, and decide whether batch-1 latency or batched throughput is the deployment target.
+2. **For batch-1 latency, the runtime path is still the lever.** If single-image latency (not throughput) is the goal, INT8 at batch 1 stays a wash — pursue end-to-end INT8 block fusion (kill the reformat tax), newer TensorRT MHA fusion, or weight-only quant. Selective `conv-projector-only` / `no-dino-mlp-attn` policies preserve accuracy but do not help batch-1 speed.
 3. **Supervised QAT.** Distillation recovers most of the PTQ gap; a supervised `SetCriterion` fine-tune (with Hungarian matching) is the next lever if more accuracy is needed.
 4. **Broader AO comparison.** The PyTorch AO RF-DETR script exists; run the same 1500-image eval and TensorRT export path once an AO ONNX export is proven.
 5. **Repo layout.** If RF-DETR support grows, rename the top-level package from `yolo_quantization/` to `model_quantization/` and split the workstreams.
