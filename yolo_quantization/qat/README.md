@@ -156,7 +156,42 @@ runs/modelopt_qat/yolo26s/
 
 ## Current Metrics
 
-Fixed-export `yolo26s` metrics have not been regenerated yet. Use the `yolo11s` fixed-export sections above as the current validated ModelOpt INT8 result until a fresh `yolo26s` run is recorded.
+### Real QAT FPS + Accuracy Check for `yolo26s` (2026-05-27)
+
+After the fixed ModelOpt checkpoint/export path, `yolo26s` was validated and benchmarked with the full `yolo26-distill` recipe: `entropy` calibration over 260 images, 10 epochs x 200 batches/epoch x batch 10, detect-head output quantizers enabled, DFL enabled, seed 42.
+
+Export verification:
+
+```text
+yolo26s_qat.onnx: QuantizeLinear=302, DequantizeLinear=302, Conv Q/DQ=102/102
+```
+
+Training-side validation from `runs/modelopt_qat/yolo26s/summary.json`:
+
+| Stage | mAP50 | mAP50-95 | Notes |
+|---|---:|---:|---|
+| PTQ fake quant | 0.6368 | 0.4706 | 260-image entropy calibration |
+| QAT fake quant | 0.6370 | 0.4706 | distill QAT |
+
+Deployment ONNX accuracy from `scripts/measure_accuracy.sh yolo26s`:
+
+| Model/artifact | mAP50 | mAP50-95 | Drop vs PyTorch FP32 | Drop vs ONNX FP32 |
+|---|---:|---:|---:|---:|
+| PyTorch FP32 `yolo26s.pt` | 0.6385 | 0.4718 | baseline | - |
+| ONNX FP32 | 0.6362 | 0.4717 | -0.0001 | baseline |
+| QAT INT8 ONNX | 0.6354 | 0.4700 | -0.0018 | -0.0017 |
+
+TensorRT latency/throughput from `scripts/measure_speedup.sh yolo26s --iterations 200 --warmup 1000`:
+
+| Engine | Mean latency | Throughput | vs FP16 |
+|---|---:|---:|---:|
+| FP32 | 6.2365 ms | 160.3 FPS | 0.36x |
+| FP16 baseline | 2.2317 ms | 447.8 FPS | 1.00x |
+| QAT INT8 | 2.5955 ms | 385.0 FPS | 0.86x |
+
+#### Metric Interpretation
+- **Accuracy**: The fixed ModelOpt QAT export achieves near-lossless INT8 accuracy for `yolo26s`, matching within **-0.0017 mAP50-95** of the ONNX FP32 baseline and **-0.0018 mAP50-95** of the PyTorch FP32 baseline.
+- **Latency/Throughput**: Unlike `yolo11s` which achieved a 1.18x speedup over FP16 by excluding DFL and detect-head output quantizers, the fully quantized `yolo26s` (including DFL and detect-head outputs) runs **14% slower** than the FP16 baseline. This indicates that for small models at batch size 1, the scheduling and reformatting overhead from the 102/102 quantized convolutions and extra Q/DQ layers outweighs the computation speedup of INT8 on this GPU. We keep `yolo26s` QAT fully quantized for research/comparative reference.
 
 ---
 

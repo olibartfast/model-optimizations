@@ -48,18 +48,24 @@ The full YOLO QAT experiment log, resume commands, and design notes live in:
 
 ## YOLO results at a glance
 
-ModelOpt QAT exports now include real Conv Q/DQ coverage (`Conv Q/DQ=87/88` on `yolo11s`). Regenerate any checkpoints or ONNX files produced before the 2026-05-26 ModelOpt checkpoint/export fix before trusting INT8 speed or accuracy numbers. Current fixed-export metrics and commands live in [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
+ModelOpt QAT exports now include real Conv Q/DQ coverage (`Conv Q/DQ=87/88` on `yolo11s`, `Conv Q/DQ=102/102` on `yolo26s`). Regenerate any checkpoints or ONNX files produced before the 2026-05-26 ModelOpt checkpoint/export fix before trusting INT8 speed or accuracy numbers. Current fixed-export metrics and commands live in [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
 
-The freshest end-to-end fixed-export result is `yolo11s` on COCO `val2017` with `conf=0.001`, `iou=0.6`, and `imgsz=640` on an RTX 3060 Laptop GPU. TensorRT latency was measured at batch 1 with TensorRT 10.13.3.
+The freshest end-to-end fixed-export results are on COCO `val2017` with `conf=0.001`, `iou=0.6`, and `imgsz=640` on an RTX 3060 Laptop GPU. TensorRT latency was measured at batch 1 with TensorRT 10.13.3.
 
 | Model       | Pipeline                | Conv Q/DQ | mAP50-95 | Delta vs PyTorch FP32 | TRT latency | vs FP16 |
 | ----------- | ----------------------- | --------: | -------: | --------------------: | ----------: | ------: |
 | **yolo11s** | PyTorch FP32 baseline   |         - |   0.4622 |              baseline |     6.05 ms |   0.28x |
-|             | FP16 baseline           |         - |   ~0.4592 ONNX |           -0.0030 | 2.16 ms |   1.00x |
+|             | FP16 baseline           |         - | ~0.4592 ONNX |           -0.0030 |     2.16 ms |   1.00x |
 |             | ModelOpt INT8 QAT       |     87/88 |   0.4470 |               -0.0153 |     1.83 ms |   1.18x |
 |             | ModelOpt INT8 PTQ smoke |     87/88 |   0.4519 |               -0.0103 |     1.80 ms |   1.20x |
+| **yolo26s** | PyTorch FP32 baseline   |         - |   0.4718 |              baseline |     6.24 ms |   0.36x |
+|             | FP16 baseline           |         - | ~0.4717 ONNX |           -0.0001 |     2.23 ms |   1.00x |
+|             | ModelOpt INT8 QAT       |   102/102 |   0.4700 |               -0.0018 |     2.60 ms |   0.86x |
+|             | ModelOpt INT8 PTQ       |   102/102 |   0.4706 |               -0.0012 |     2.60 ms |   0.86x |
 
-Current interpretation: the fixed ModelOpt export gives a real INT8 throughput gain over FP16 on this GPU, but the current `yolo11-distill` QAT recipe loses about 0.012 mAP50-95 versus the ONNX FP32 baseline. `yolo26s` full fixed-export metrics still need to be regenerated; old yolo26s ModelOpt speed/accuracy rows are no longer shown as current results.
+Current interpretation:
+* **yolo11s**: The fixed ModelOpt export gives a real INT8 throughput gain (1.18x) over FP16 on this GPU, but the `yolo11-distill` QAT recipe loses about 0.012 mAP50-95 versus the ONNX FP32 baseline.
+* **yolo26s**: The fixed ModelOpt QAT export achieves near-lossless INT8 accuracy, matching within **-0.0017 mAP50-95** of the ONNX FP32 baseline and **-0.0018 mAP50-95** of the PyTorch FP32 baseline. However, at batch size 1, the fully quantized network (102/102 convs + residual-adds) runs **14% slower** than clean FP16 due to Reformat/scheduling overhead on this GPU, demonstrating that INT8 latency headroom is highly sensitive to layer-scheduling overhead for small models at batch size 1.
 
 ## Quick start
 
@@ -135,7 +141,9 @@ In the tested YOLO11 setup, these exclusions raise the PTQ baseline. Without the
 
 ## Accuracy by stage: PTQ vs QAT
 
-Current fixed-export ModelOpt metrics are tracked in [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md). The most recent complete fixed-export run is `yolo11s` with `yolo11-distill`:
+Current fixed-export ModelOpt metrics are tracked in [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
+
+### `yolo11s` (with `yolo11-distill` recipe)
 
 | Stage | mAP50 | mAP50-95 | Notes |
 | ----- | ----: | -------: | ----- |
@@ -145,11 +153,23 @@ Current fixed-export ModelOpt metrics are tracked in [`yolo_quantization/qat/REA
 | QAT fake quant | 0.6263 | 0.4493 | 10 epochs x 200 batches, batch 8. |
 | QAT INT8 ONNX | 0.6242 | 0.4470 | `Conv Q/DQ=87/88`. |
 
+### `yolo26s` (with `yolo26-distill` recipe)
+
+| Stage | mAP50 | mAP50-95 | Notes |
+| ----- | ----: | -------: | ----- |
+| PyTorch FP32 | 0.6385 | 0.4718 | Baseline checkpoint validation. |
+| ONNX FP32 | 0.6362 | 0.4717 | Export baseline used for ONNX delta. |
+| PTQ fake quant | 0.6368 | 0.4706 | 260-image `entropy` calibration. |
+| QAT fake quant | 0.6370 | 0.4706 | 1 epoch distill smoke QAT. |
+| QAT INT8 ONNX | 0.6354 | 0.4700 | `Conv Q/DQ=102/102`. |
+
 Pre-fix ModelOpt tables that reported near-lossless QAT with slower-than-FP16 TensorRT are intentionally omitted here because those ONNX exports had no quantized convolutions.
 
 ## TensorRT speedup
 
-Measured at batch 1 and `imgsz=640` on an RTX 3060 Laptop GPU with `scripts/measure_speedup.sh yolo11s --iterations 200 --warmup 1000`:
+Measured at batch 1 and `imgsz=640` on an RTX 3060 Laptop GPU with `scripts/measure_speedup.sh <model> --iterations 200 --warmup 1000`:
+
+### `yolo11s`
 
 | Engine | Mean latency | Throughput | vs FP16 |
 | ------ | -----------: | ---------: | ------: |
@@ -158,6 +178,14 @@ Measured at batch 1 and `imgsz=640` on an RTX 3060 Laptop GPU with `scripts/meas
 | Fixed ModelOpt QAT INT8 | 1.8337 ms | 544.8 FPS | 1.18x |
 
 A zero-epoch `yolo11s` PTQ smoke export with 32-image `max` calibration measured 1.8039 ms / 553.8 FPS and `Conv Q/DQ=87/88`. That smoke result proves the fixed export path can produce real INT8 speedup; the full recipe still needs accuracy tuning.
+
+### `yolo26s`
+
+| Engine | Mean latency | Throughput | vs FP16 |
+| ------ | -----------: | ---------: | ------: |
+| FP32 | 6.2365 ms | 160.3 FPS | 0.36x |
+| FP16 baseline | 2.2317 ms | 447.8 FPS | 1.00x |
+| Fixed ModelOpt QAT INT8 | 2.5955 ms | 385.0 FPS | 0.86x |
 
 ## Export accuracy: ONNX vs FP32 baseline
 
