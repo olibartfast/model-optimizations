@@ -1,34 +1,5 @@
 # YOLO26-small INT8 QAT Work Log
 
-> ## Historical issue — stale ModelOpt exports did not quantize convolutions (found 2026-05-21, fixed 2026-05-26)
->
-> Stale pre-fix `runs/modelopt_qat/<stem>/<stem>_qat.onnx` graphs were **not valid INT8 models**:
->
-> | Export | Conv layers | Q/DQ pairs | Convs with Q/DQ on act+weight |
-> |---|---:|---:|---:|
-> | `yolo11s_qat.onnx` (ModelOpt) | 88 | 22 | **0** |
-> | `yolo26s_qat.onnx` (ModelOpt) | 102 | 26 | **0** |
-> | `yolo11s_ao_qat.onnx` (AO) | 88 | 186 | 63 ✅ |
-> | `yolo26s_ao_qat.onnx` (AO) | 102 | 151 | 78 ✅ |
->
-> Only the ~22-26 patched residual-add quantizers reached those ONNX files; **every conv `input_quantizer`
-> / `weight_quantizer` from `mtq` was dropped at export.** A `trtexec --dumpLayerInfo` build
-> confirms the engine runs FP16 conv tactics throughout (`f16f16…`, no `i8i8`/`imma`) plus 76
-> Reformat layers — so the ModelOpt "INT8 QAT" engine is FP16 + reformat overhead, and measures
-> *slower* than a plain FP16 engine (yolo11s 2.48 ms vs FP16 2.15 ms).
->
-> Consequences: every pre-fix "ModelOpt INT8" latency/speedup/accuracy number in this file and
-> the root README was invalid as an INT8 result. Regenerated checkpoints after 2026-05-26 are
-> expected to report high Conv Q/DQ coverage at export; stale checkpoints must be regenerated.
->
-> Root cause found 2026-05-26: the manual ModelOpt PTQ path used `mtq.replace_quant_module()`
-> directly, which inserted `QuantConv2d` in memory but left `mto.save()` with an empty
-> `modelopt_state`. Restored PTQ/QAT checkpoints therefore had only the custom residual-add
-> quantizers. The script now uses ModelOpt's registered `quantize` mode before the custom
-> entropy/percentile calibration path, and export verification reports Conv nodes that have
-> Q/DQ on both activation and weight inputs. Regenerate PTQ/QAT checkpoints before trusting
-> any ModelOpt INT8 speed or accuracy result.
-
 Procedure adapted from [NVIDIA-AI-IOT/yolo_deepstream/yolov7_qat](https://github.com/NVIDIA-AI-IOT/yolo_deepstream/tree/main/yolov7_qat):
 
 1. PTQ histogram calibration on COCO images.
@@ -93,7 +64,7 @@ Command:
 QUANTIZATION_VENV=./quantization_venv ./scripts/measure_speedup.sh yolo11s --iterations 200 --warmup 1000
 ```
 
-The old `yolo11s` ModelOpt export had `Conv Q/DQ=0/88` and measured slower than FP16. This fresh fixed export is the first ModelOpt result in this repo that shows a real INT8 FPS gain versus FP16 on this GPU.
+This fixed export is the first ModelOpt result in this repo that shows a real INT8 FPS gain versus FP16 on this GPU.
 
 ## Real QAT FPS + Accuracy Check (2026-05-27)
 
@@ -185,24 +156,7 @@ runs/modelopt_qat/yolo26s/
 
 ## Current Metrics
 
-> Historical pre-fix yolo26s metrics: these were produced before the 2026-05-26 ModelOpt
-> checkpoint/export fix. The exported ONNX had **0 quantized convolutions**, so the tiny
-> PTQ/QAT deltas below mostly reflect the residual-add quantizers, not network-wide INT8.
-
-Metrics are from `runs/modelopt_qat/yolo26s/summary.json` for the full-source rerun, except FP32, which was not rerun in the metric command.
-
-| Stage | mAP50 | mAP50-95 | Δ mAP50-95 vs FP32 | Δ mAP50-95 vs PTQ | Notes |
-|---|---:|---:|---:|---:|---|
-| FP32 | 0.6384 | 0.4718 | baseline | - | Previously measured with the same val params. |
-| PTQ INT8 | 0.6368 | 0.4706 | -0.0012 | baseline | Fresh PTQ from 260-image entropy calibration. |
-| QAT INT8 | 0.6370 | 0.4701 | -0.0017 | -0.0005 | 10 x 200 x batch-10 full-source QAT. |
-
-Raw saved values:
-
-```text
-PTQ: mAP50=0.6368257036873418, mAP50-95=0.47062866593006675, val=64.5s
-QAT: mAP50=0.6369914336897926, mAP50-95=0.47010458539764405, val=66.1s
-```
+Fixed-export `yolo26s` metrics have not been regenerated yet. Use the `yolo11s` fixed-export sections above as the current validated ModelOpt INT8 result until a fresh `yolo26s` run is recorded.
 
 ---
 
