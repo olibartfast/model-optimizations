@@ -48,7 +48,7 @@ The full YOLO QAT experiment log, resume commands, and design notes live in:
 
 ## YOLO results at a glance
 
-ModelOpt QAT exports now include real Conv Q/DQ coverage (`Conv Q/DQ=87/88` on `yolo11s`, `Conv Q/DQ=102/102` on `yolo26s`). Regenerate any checkpoints or ONNX files produced before the 2026-05-26 ModelOpt checkpoint/export fix before trusting INT8 speed or accuracy numbers. Current fixed-export metrics and commands live in [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
+ModelOpt QAT exports include real Conv Q/DQ coverage. The current metrics and commands live in [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
 
 The freshest end-to-end fixed-export results are on COCO `val2017` with `conf=0.001`, `iou=0.6`, and `imgsz=640` on an RTX 3060 Laptop GPU. TensorRT latency was measured at batch 1 with TensorRT 10.13.3.
 
