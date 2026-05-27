@@ -102,7 +102,7 @@ python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
   --seed 0
 ```
 
-For a shorter smoke test:
+For a shorter validation check:
 
 ```bash
 python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
@@ -147,7 +147,7 @@ python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
   --models yolo11x \
   --data configs/my_dataset.yaml \
   --calib-source train \
-  --quant-modes int8 fp8 \
+  --quant-modes int8 \
   --calib-size 256
 ```
 
@@ -157,7 +157,6 @@ PTQ outputs land under:
 runs/modelopt/<model>/
   <model>.onnx
   <model>_int8.onnx
-  <model>_fp8.onnx
   summary.json
 ```
 
@@ -185,5 +184,5 @@ skips COCO auto-download when `--data` is present:
 - `--qat-recipe auto` still selects by model family: YOLO26 uses
   `yolo26-distill`; single-head models use `yolo11-distill`.
 - If your dataset is much smaller than COCO, reduce `--calib-size`,
-  `--qat-batches-per-epoch`, and `--batch` for the first smoke test.
+  `--qat-batches-per-epoch`, and `--batch` for the first validation check.
 - Direct image-list calibration files should contain one image path per line.

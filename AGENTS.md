@@ -6,10 +6,10 @@ This file provides guidance to coding agents (Claude Code, etc.) when working wi
 
 ## What this repo is
 
-Research scripts for **INT8 / FP8 / INT4 quantization of Ultralytics YOLO**
-detectors (YOLO11x, YOLO26x, YOLO26s, etc.) via **NVIDIA ModelOpt**, evaluated
-against **COCO `val2017`** by default. The canonical pipelines also accept
-custom Ultralytics detection dataset YAMLs via `--data`. Two pipelines:
+Research scripts for **INT8 quantization of Ultralytics YOLO** detectors
+(YOLO11x, YOLO26x, YOLO26s, etc.) via **NVIDIA ModelOpt**, evaluated against
+**COCO `val2017`** by default. The canonical pipelines also accept custom
+Ultralytics detection dataset YAMLs via `--data`. Two pipelines:
 
 - **PTQ** (post-training, ONNX-based) — `yolo_quantization/ptq/nvidia_modelopt_yolo.py`
 - **QAT** (post-training calibration + fine-tune, torch-based) — `yolo_quantization/qat/nvidia_modelopt_yolo_qat.py`
@@ -154,16 +154,6 @@ python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
   --quant-modes int8
 ```
 
-**Experiment driver** (`scripts/run_qat_experiments.sh`) runs the recipe across
-multiple variants and stashes outputs under `runs/modelopt_qat_experiments/`:
-
-```bash
-DRY_RUN=1 ./scripts/run_qat_experiments.sh seeds      # preview the 3-seed plan
-./scripts/run_qat_experiments.sh matrix               # yolo26{n,s,m,l,x} + yolo11x
-./scripts/run_qat_experiments.sh ablation             # --disable-detect-output-quant on/off
-./scripts/run_qat_experiments.sh seeds                # 3-seed variance for yolo26s
-```
-
 **TensorRT runtime benchmark** of an exported `*_qat.onnx`:
 
 ```bash
@@ -181,7 +171,7 @@ bash scripts/cloud_bootstrap.sh
 **Run PTQ-only ONNX pipeline**:
 ```bash
 python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
-  --models yolo11x --quant-modes int8 fp8 --calib-size 256
+  --models yolo11x --quant-modes int8 --calib-size 256
 ```
 
 Outputs land in `runs/modelopt_qat/<model>/` (QAT: `*_ptq.pth`, `*_qat.pth`,

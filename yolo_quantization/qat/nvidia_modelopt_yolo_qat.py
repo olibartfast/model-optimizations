@@ -77,9 +77,7 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 # argparse defaults. Only keys the user did not explicitly pass on the CLI
 # are overwritten (see :func:`_apply_recipe`). The `auto` recipe picks one
 # per model family: E2E YOLO26 stays on the distillation recipe that earned
-# the recorded yolo26s baseline; a separate yolo26-speed recipe trades some
-# quantization coverage for lower TensorRT reformat/QDQ overhead; single-head
-# models (YOLOv8/v11/v12) switch
+# the recorded yolo26s baseline; single-head models (YOLOv8/v11/v12) switch
 # to a variant that *keeps the DFL head and Detect output quantizers in
 # floating-point* during INT8 quantization (those layers are particularly
 # noise-sensitive on single-head architectures).
@@ -107,31 +105,6 @@ QAT_RECIPES: dict[str, dict] = {
         "exclude_dfl_quant": False,
         "no_residual_add_quant": False,
         "no_share_residual_add_scales": False,
-    },
-    "yolo26-speed": {
-        # Deployment-oriented YOLO26 variant. The fully quantized yolo26s
-        # baseline is near-lossless but slower than FP16 at batch 1 on the
-        # recorded RTX 3060 Laptop GPU because TensorRT spends too much time
-        # scheduling/reformatting explicit residual-add and head Q/DQ islands.
-        #
-        # This recipe follows the ModelOpt PTQ workflow from NVIDIA's May 2026
-        # blog: calibrate representative data, evaluate, iterate on quantized
-        # layer coverage, then export for TensorRT where speedups actually
-        # materialize. It keeps the backbone/neck Conv weights and activations
-        # quantized, but leaves residual adds, DFL, and Detect outputs in
-        # floating point to prioritize INT8-vs-FP16 FPS.
-        "qat_epochs": 0,
-        "qat_batches_per_epoch": 200,
-        "qat_lr": 1e-5,
-        "qat_low_lr": 1e-6,
-        "qat_distill_weight": 1.0,
-        "qat_supervised_weight": 1.0,
-        "calib_method": "max",
-        "calib_size": 1024,
-        "disable_detect_output_quant": True,
-        "exclude_dfl_quant": True,
-        "no_residual_add_quant": True,
-        "no_share_residual_add_scales": True,
     },
     "yolo11-supervised": {
         # Supervised-only fine-tune, max calibration, DFL + Detect-output
@@ -2156,8 +2129,7 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Optional run directory name under runs/modelopt_qat/. Requires one model. "
-            "Useful for recipe variants such as yolo26s_speed without overwriting "
-            "the baseline yolo26s artifacts."
+            "Useful when keeping multiple explicit INT8 runs for one model."
         ),
     )
     p.add_argument("--data", type=Path, default=DEFAULT_DATA_YAML, help="Ultralytics dataset YAML for validation and QAT training")

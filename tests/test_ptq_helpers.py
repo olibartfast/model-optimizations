@@ -35,11 +35,11 @@ def test_parse_args_defaults_and_quant_mode_validation():
         module.parse_args(["--quant-modes", "not-a-mode"])
 
 
-def test_parse_args_accepts_multiple_quant_modes():
+def test_parse_args_accepts_int8_quant_mode():
     module = _load_ptq_module()
-    args = module.parse_args(["--quant-modes", "int8", "fp8", "--imgsz", "320"])
+    args = module.parse_args(["--quant-modes", "int8", "--imgsz", "320"])
 
-    assert args.quant_modes == ["int8", "fp8"]
+    assert args.quant_modes == ["int8"]
     assert args.imgsz == 320
 
 

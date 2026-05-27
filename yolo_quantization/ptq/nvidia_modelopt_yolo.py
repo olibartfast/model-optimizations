@@ -9,7 +9,7 @@ Workflow
 3. Build a calibration dataset from the Ultralytics dataset YAML (COCO
    ``val2017`` by default) using the same preprocessing as Ultralytics.
 4. Run NVIDIA ``modelopt.onnx.quantization`` post-training quantization
-   (INT8 / FP8 / INT4) with the calibration data.
+   (INT8) with the calibration data.
 5. Validate the quantized ONNX model with Ultralytics
    (``model.val(data=<dataset.yaml>)``) to get mAP50 / mAP50-95.
 6. Optionally run inference on a sample image source and save
@@ -19,7 +19,7 @@ Usage
 -----
     python yolo_quantization/ptq/nvidia_modelopt_yolo.py \
         --models yolo11x yolo26x \
-        --quant-modes int8 fp8 \
+        --quant-modes int8 \
         --calib-size 256 \
         --imgsz 640
 
@@ -60,7 +60,7 @@ OUT_ROOT = PROJECT_ROOT / "runs" / "modelopt"
 
 DEFAULT_MODELS = ("yolo11x", "yolo26x")
 DEFAULT_MODES = ("int8",)
-SUPPORTED_MODES = ("int8", "fp8", "int4")
+SUPPORTED_MODES = ("int8",)
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
@@ -293,7 +293,7 @@ def quantize_onnx(
 @dataclass
 class EvalResult:
     model: str
-    variant: str  # "fp32" | "int8" | "fp8" | "int4"
+    variant: str  # "fp32" | "int8"
     onnx_path: str
     size_mb: float
     map50: float | None = None
@@ -545,7 +545,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--skip-val",
         action="store_true",
-        help="Skip COCO mAP evaluation (useful for a quick quantization smoke test)",
+        help="Skip COCO mAP evaluation (useful for a quick quantization check)",
     )
     return p.parse_args(argv)
 

@@ -33,39 +33,6 @@ Why 260 and 20,000: the NVIDIA yolov7_qat/cuDLA QAT scripts use batch 10, `num_b
 
 ---
 
-## Fresh Fixed-Export Speed Smoke (2026-05-27)
-
-After fixing the manual ModelOpt path to save a non-empty `modelopt_state`, a short `yolo11s` PTQ/zero-epoch export was regenerated and benchmarked through TensorRT 10.13.3 on the RTX 3060 Laptop GPU at `imgsz=640`, batch 1. This is a speed smoke test, not a final accuracy recipe run: calibration used only 32 images with `max`, and QAT used 0 epochs.
-
-Export verification:
-
-```text
-yolo11s_qat.onnx: QuantizeLinear=199, DequantizeLinear=199, Conv Q/DQ=87/88
-```
-
-Accuracy from the same fresh artifact:
-
-| Model/artifact | mAP50 | mAP50-95 | Drop vs PyTorch FP32 | Drop vs ONNX FP32 |
-|---|---:|---:|---:|---:|
-| PyTorch FP32 `yolo11s.pt` | 0.6374 | 0.4622 | baseline | - |
-| ONNX FP32 | 0.6336 | 0.4592 | -0.0030 | baseline |
-| Fixed ModelOpt INT8 ONNX | 0.6263 | 0.4519 | -0.0103 | -0.0073 |
-
-TensorRT latency/throughput:
-
-| Engine | Mean latency | Throughput | vs FP16 |
-|---|---:|---:|---:|
-| FP16 baseline | 2.1686 ms | 460.8 FPS | 1.00x |
-| Fixed ModelOpt INT8 | 1.8039 ms | 553.8 FPS | 1.20x |
-
-Command:
-
-```bash
-QUANTIZATION_VENV=./quantization_venv ./scripts/measure_speedup.sh yolo11s --iterations 200 --warmup 1000
-```
-
-This fixed export is the first ModelOpt result in this repo that shows a real INT8 FPS gain versus FP16 on this GPU.
-
 ## Real QAT FPS + Accuracy Check (2026-05-27)
 
 After the fixed ModelOpt checkpoint/export path, `yolo11s` was rerun with the full `yolo11-distill` QAT recipe: `max` calibration over 1024 images, 10 epochs x 200 batches/epoch x batch 8, detect-head output quantizers disabled, DFL excluded, seed 0.
@@ -119,51 +86,7 @@ TensorRT latency/throughput from `scripts/measure_speedup.sh yolo11s --iteration
 | FP16 baseline | 2.1614 ms | 462.3 FPS | 1.00x |
 | QAT INT8 | 1.8337 ms | 544.8 FPS | 1.18x |
 
-This confirms the fixed ModelOpt QAT export gives a real INT8 FPS gain versus FP16 on this RTX 3060 Laptop GPU, but the 10-epoch QAT recipe does not recover the zero-epoch smoke-test ONNX accuracy; it ends at `mAP50-95=0.4470`.
-
-## YOLO26 Speed-Oriented INT8 Path
-
-The accuracy-first `yolo26-distill` artifact is near-lossless but slower than FP16 at batch 1. Following NVIDIA's ModelOpt PTQ workflow (prepare, calibrate representative data, fake-quant evaluate, iterate on quantized layer coverage, then export/deploy in TensorRT), the repo now provides an explicit speed variant:
-
-```bash
-python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
-  --models yolo26s \
-  --qat-recipe yolo26-speed \
-  --output-name yolo26s_speed \
-  --skip-fp32-eval \
-  --seed 0
-
-./scripts/measure_speedup.sh yolo26s --run-name yolo26s_speed \
-  --iterations 200 --warmup 1000
-```
-
-Recipe intent:
-
-| Setting | Value |
-|---|---:|
-| QAT epochs | 0 (PTQ export only) |
-| Calibration method | `max` |
-| Calibration budget | 1024 images |
-| Residual-add quantizers | disabled |
-| DFL quantizers | disabled |
-| Detect output quantizers | disabled |
-
-Measured result on the RTX 3060 Laptop GPU with TensorRT 10.13.3 at `imgsz=640`, batch 1:
-
-| Engine | Mean latency | Throughput | vs FP16 |
-|---|---:|---:|---:|
-| FP32 | 6.2755 ms | 159.3 FPS | 0.35x |
-| FP16 baseline | 2.2172 ms | 450.7 FPS | 1.00x |
-| YOLO26 speed INT8 | 1.9044 ms | 524.7 FPS | 1.16x |
-
-Accuracy from `runs/modelopt_qat/yolo26s_speed/summary.json`:
-
-| Stage | mAP50 | mAP50-95 | Notes |
-|---|---:|---:|---|
-| PTQ fake quant | 0.5955 | 0.4255 | 1024-image `max` calibration, residual-add/DFL/Detect-output quantizers disabled |
-| QAT fake quant | 0.5955 | 0.4255 | zero-epoch speed export; no fine-tuning |
-
-This variant achieves the requested INT8 FPS increase versus FP16, but it is **not** a near-lossless QAT recipe. Use it only when latency is prioritized over COCO mAP.
+This confirms the fixed ModelOpt QAT export gives a real INT8 FPS gain versus FP16 on this RTX 3060 Laptop GPU, but the 10-epoch QAT recipe does not recover the zero-epoch ONNX check accuracy; it ends at `mAP50-95=0.4470`.
 
 ## Current Run
 
@@ -277,7 +200,6 @@ per model family (yolo26* → `yolo26-distill`; everything else →
 | Recipe | Targets | LR ladder | Loss | Calibration | Detect output Q | DFL Q | Epochs |
 |---|---|---|---|---|---|---|---|
 | `yolo26-distill` | E2E dual-head (yolo26*) | 1e-5 peak / 1e-6 low | distill (1.0) + supervised (1.0) | entropy, 260 imgs | enabled | enabled | 10 |
-| `yolo26-speed` | E2E dual-head (yolo26*) latency runs | n/a | none | **max, 1024 imgs** | **disabled** | **disabled** | 0 |
 | `yolo11-distill` | Single-head (v8/v11/…) | 1e-5 peak / 1e-6 low | distill (1.0) + supervised (1.0) | **max, 1024 imgs** | **disabled** | **disabled** | 10 |
 | `yolo11-supervised` | Single-head, larger PTQ-FP32 gap (rare) | 1e-4 peak / 1e-5 low | supervised-only (1.0) | max, 1024 imgs | disabled | disabled | 5 |
 
@@ -310,19 +232,6 @@ The DFL-exclusion technique is documented in the
 reference in the ubonpartners/ultralytics fork, but the underlying observation
 is independent of that fork — DFL's bin-probability semantics are why INT8
 hurts it.
-
----
-
-## Future Roadmap
-
-- INT4 QAT exploration: keep the production baseline on INT8 QAT until INT4 has its own smoke-tested path. Start with ModelOpt torch `INT4_AWQ_CFG` or `INT4_BLOCKWISE_WEIGHT_ONLY_CFG` as weight-only INT4 fine-tuning, then consider activation INT4 only after the weight-only path is stable.
-- Required smoke checks before any full COCO run: PTQ/restore succeeds, one-batch backward works, mAP is sane on a small validation slice, and ONNX export/deployability is verified. Do not treat activation+weight INT4 as ready or expected to work until those checks pass.
-
-The PyTorch AO fake-quant alternative (`pytorch_ao_yolo_qat.py`) is no longer
-roadmap work — it is benchmarked end-to-end. See
-[PyTorch AO quantization details](../../README.md#pytorch-ao-quantization-details)
-in the top-level [`README.md`](../../README.md) for results and the
-[Commands](#commands) section below for how to run it.
 
 ---
 
@@ -402,7 +311,7 @@ python yolo_quantization/qat/pytorch_ao_yolo_qat.py \
   --no-export
 ```
 
-Quick AO plumbing smoke test (calibration + one train batch, no full COCO val):
+Quick AO plumbing check (calibration + one train batch, no full COCO val):
 
 ```bash
 python yolo_quantization/qat/pytorch_ao_yolo_qat.py \
@@ -495,17 +404,6 @@ should provide the usual `path`, `train`, `val`, and `names` fields.
 `train2017`/`val2017`, or a direct path to an image directory or image-list
 text file. For custom datasets, using `train` for calibration avoids calibrating
 on the validation split that is later used for mAP.
-
-Run the runtime experiment matrices (each subrun copies its outputs into
-`runs/modelopt_qat_experiments/<mode>/<tag>/` so the canonical tree is not
-overwritten):
-
-```bash
-./scripts/run_qat_experiments.sh matrix       # yolo26{n,s,m,l,x} + yolo11x
-./scripts/run_qat_experiments.sh ablation     # --disable-detect-output-quant on/off
-./scripts/run_qat_experiments.sh seeds        # multi-seed variance on yolo26s
-DRY_RUN=1 ./scripts/run_qat_experiments.sh seeds   # preview the commands
-```
 
 Benchmark an exported `*_qat.onnx` through TensorRT (`trtexec` must be on PATH):
 

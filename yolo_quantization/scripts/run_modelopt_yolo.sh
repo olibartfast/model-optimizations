@@ -10,7 +10,7 @@
 #   ./scripts/run_modelopt_yolo.sh                             # QAT, yolo11x + yolo26x
 #   ./scripts/run_modelopt_yolo.sh --qat-epochs 3 --batch 32
 #   ./scripts/run_modelopt_yolo.sh --data configs/my_dataset.yaml --calib-source train
-#   ./scripts/run_modelopt_yolo.sh ptq --quant-modes int8 fp8  # ONNX-only PTQ variant
+#   ./scripts/run_modelopt_yolo.sh ptq --quant-modes int8      # ONNX-only PTQ variant
 #
 # Any remaining args are forwarded to the underlying Python script.
 

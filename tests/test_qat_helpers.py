@@ -397,7 +397,6 @@ def test_resolve_recipe_picks_distill_for_e2e_and_for_single_head():
     assert module._resolve_recipe("auto", "yolov8n", None) == "yolo11-distill"
     # explicit recipe name always wins
     assert module._resolve_recipe("yolo26-distill", "yolo11s", None) == "yolo26-distill"
-    assert module._resolve_recipe("yolo26-speed", "yolo26s", None) == "yolo26-speed"
     assert module._resolve_recipe("yolo11-supervised", "yolo11s", None) == "yolo11-supervised"
     # is_e2e overrides the name heuristic
     assert module._resolve_recipe("auto", "yolo11s", is_e2e=True) == "yolo26-distill"
@@ -482,40 +481,6 @@ def test_apply_recipe_yolo26_distill_preserves_baseline():
     assert a.disable_detect_output_quant is False
     assert a.no_residual_add_quant is False
     assert a.no_share_residual_add_scales is False
-
-
-def test_apply_recipe_yolo26_speed_reduces_qdq_overhead():
-    module = _load_qat_module()
-
-    class A:
-        pass
-
-    a = A()
-    a.qat_recipe = "yolo26-speed"
-    a.models = ["yolo26s"]
-    a.qat_epochs = 10
-    a.qat_batches_per_epoch = 200
-    a.qat_lr = 1e-5
-    a.qat_low_lr = 1e-6
-    a.qat_distill_weight = 1.0
-    a.qat_supervised_weight = 1.0
-    a.calib_method = "entropy"
-    a.calib_size = 260
-    a.disable_detect_output_quant = False
-    a.exclude_dfl_quant = False
-    a.no_residual_add_quant = False
-    a.no_share_residual_add_scales = False
-
-    resolved = module._apply_recipe(a, set())
-
-    assert resolved == "yolo26-speed"
-    assert a.qat_epochs == 0
-    assert a.calib_method == "max"
-    assert a.calib_size == 1024
-    assert a.disable_detect_output_quant is True
-    assert a.exclude_dfl_quant is True
-    assert a.no_residual_add_quant is True
-    assert a.no_share_residual_add_scales is True
 
 
 def test_write_qat_train_csv_emits_header_and_rows(tmp_path):

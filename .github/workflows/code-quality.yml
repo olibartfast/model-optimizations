@@ -39,7 +39,6 @@ jobs:
         run: |
           bash -n scripts/run_venv.sh
           bash -n scripts/run_modelopt_yolo.sh
-          bash -n scripts/run_qat_experiments.sh
           bash -n scripts/cloud_bootstrap.sh
           bash -n scripts/measure_accuracy.sh
           bash -n scripts/measure_speedup.sh
