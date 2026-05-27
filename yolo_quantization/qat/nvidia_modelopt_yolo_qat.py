@@ -414,6 +414,29 @@ def count_qdq_nodes(onnx_path: Path) -> tuple[int, int]:
     return quantize, dequantize
 
 
+def count_conv_qdq_inputs(onnx_path: Path) -> tuple[int, int]:
+    """Return (#Conv nodes, #Conv nodes fed by DQ on activation and weight inputs)."""
+    import onnx
+
+    model = onnx.load(str(onnx_path))
+    producer = {output: node for node in model.graph.node for output in node.output}
+    convs = [node for node in model.graph.node if node.op_type == "Conv"]
+    qdq_convs = 0
+    for node in convs:
+        if len(node.input) < 2:
+            continue
+        act_parent = producer.get(node.input[0])
+        weight_parent = producer.get(node.input[1])
+        if (
+            act_parent is not None
+            and act_parent.op_type == "DequantizeLinear"
+            and weight_parent is not None
+            and weight_parent.op_type == "DequantizeLinear"
+        ):
+            qdq_convs += 1
+    return len(convs), qdq_convs
+
+
 def export_onnx_modelopt(model: torch.nn.Module, imgsz: int, device: str, dst: Path) -> None:
     """Export the quantized model through ModelOpt (``export_onnx`` if available, else deploy ``get_onnx_bytes``)."""
     from ultralytics.nn.modules.head import Detect
@@ -697,10 +720,18 @@ def manual_quantize_model(
     disable_detect_output_quant: bool,
 ) -> tuple[int, int, int]:
     """Quantize a model manually so extra YOLO-specific hooks can run before calibration."""
+    from modelopt.torch.opt import apply_mode
     from modelopt.torch.quantization.model_calib import max_calibrate
+    from modelopt.torch.quantization.mode import QuantizeModeRegistry
 
-    mtq.replace_quant_module(model)
-    mtq.set_quantizer_by_cfg(model, quant_cfg["quant_cfg"])
+    # Use the registered ModelOpt conversion path so mto.save() records the
+    # quantized architecture. Calling replace_quant_module() directly inserts
+    # QuantConv2d in memory but leaves modelopt_state empty on checkpoint save.
+    mode_cfg = {
+        "quant_cfg": quant_cfg["quant_cfg"],
+        "algorithm": quant_cfg.get("algorithm", "max"),
+    }
+    apply_mode(model, mode=[("quantize", mode_cfg)], registry=QuantizeModeRegistry)
 
     patched_residual_adds = 0
     if patch_residual_adds:
@@ -1053,8 +1084,21 @@ def disable_module_quantizers(model: torch.nn.Module, prefixes: list[str]) -> tu
 def _restore_modelopt_checkpoint(mto, model: torch.nn.Module, path: Path, torch_device: torch.device) -> torch.nn.Module:
     """Restore a ModelOpt checkpoint, including local residual-add quantizer buffers."""
     objs = torch.load(path, map_location=str(torch_device), weights_only=False)
-    restored = mto.restore_from_modelopt_state(model, objs["modelopt_state"])
     state_dict = objs["model_state_dict"]
+    modelopt_state = copy.deepcopy(objs["modelopt_state"])
+    for _mode_name, payload in modelopt_state.get("modelopt_state_dict", []):
+        metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+        quantizer_state = metadata.get("quantizer_state", {})
+        for key in list(quantizer_state):
+            if "add_lhs_quantizer" in key or "add_rhs_quantizer" in key:
+                quantizer_state.pop(key)
+    restored = mto.restore_from_modelopt_state(model, modelopt_state)
+
+    if any("add_lhs_quantizer" in key or "add_rhs_quantizer" in key for key in state_dict):
+        _, mtq = _import_modelopt_qat_modules()
+        quant_cfg = build_quant_cfg(mtq, "max", 99.99)
+        patch_residual_add_quantizers(restored, quant_cfg)
+
     current_keys = set(restored.state_dict().keys())
     for key, value in state_dict.items():
         if key in current_keys or not key.endswith("._amax"):
@@ -1603,11 +1647,6 @@ def run_qat_for_model(
         if from_ptq is not None:
             if not from_ptq.is_file():
                 raise FileNotFoundError(f"--from-ptq is not a file: {from_ptq}")
-            if patch_residual_adds:
-                quant_cfg = build_quant_cfg(mtq, calib_method, calib_percentile)
-                patched_adds = patch_residual_add_quantizers(yolo.model, quant_cfg)
-                if patched_adds:
-                    print(f"  [ptq] patched {patched_adds} residual add module(s) before restore")
             print(f"  [ptq] restoring {from_ptq}")
             yolo.model = _restore_modelopt_checkpoint(mto, yolo.model, from_ptq, torch_device)
             if exclude_dfl_quant:
@@ -1780,9 +1819,16 @@ def run_qat_for_model(
         if onnx_path is not None:
             try:
                 q_nodes, dq_nodes = count_qdq_nodes(onnx_path)
-                print(f"  [export] ONNX Q/DQ nodes: QuantizeLinear={q_nodes}, DequantizeLinear={dq_nodes}")
+                conv_nodes, conv_qdq_nodes = count_conv_qdq_inputs(onnx_path)
+                print(
+                    f"  [export] ONNX Q/DQ nodes: QuantizeLinear={q_nodes}, "
+                    f"DequantizeLinear={dq_nodes}; Conv Q/DQ={conv_qdq_nodes}/"
+                    f"{conv_nodes}"
+                )
                 if q_nodes == 0 or dq_nodes == 0:
                     print("  [export] WARN: exported ONNX does not appear to preserve explicit Q/DQ")
+                if conv_nodes and conv_qdq_nodes * 2 < conv_nodes:
+                    print("  [export] WARN: fewer than half of Conv nodes have activation+weight Q/DQ")
             except Exception as e:
                 print(f"  [export] WARN: Q/DQ verification failed: {e}")
 

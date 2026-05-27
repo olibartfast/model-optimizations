@@ -1,6 +1,6 @@
 # YOLO26-small INT8 QAT Work Log
 
-> ## ⚠️ KNOWN ISSUE — the ModelOpt INT8 export does not quantize convolutions (found 2026-05-21)
+> ## Historical issue — stale ModelOpt exports did not quantize convolutions (found 2026-05-21, fixed 2026-05-26)
 >
 > The exported `runs/modelopt_qat/<stem>/<stem>_qat.onnx` graphs are **not valid INT8 models**:
 >
@@ -17,11 +17,17 @@
 > Reformat layers — so the ModelOpt "INT8 QAT" engine is FP16 + reformat overhead, and measures
 > *slower* than a plain FP16 engine (yolo11s 2.48 ms vs FP16 2.15 ms).
 >
-> Consequences: every "ModelOpt INT8" latency/speedup/accuracy number in this file and the root
-> README is invalid as an INT8 result. The script's export check only warns when Q/DQ count is
-> exactly 0, so 22 stray nodes passed silently. A real-INT8 fix strategy is being planned;
-> until then, treat the PyTorch AO path as the only working INT8 export, and FP16 as the
-> deployment baseline on this GPU.
+> Consequences: every pre-fix "ModelOpt INT8" latency/speedup/accuracy number in this file and
+> the root README was invalid as an INT8 result. Regenerated checkpoints after 2026-05-26 are
+> expected to report high Conv Q/DQ coverage at export; stale checkpoints must be regenerated.
+>
+> Root cause found 2026-05-26: the manual ModelOpt PTQ path used `mtq.replace_quant_module()`
+> directly, which inserted `QuantConv2d` in memory but left `mto.save()` with an empty
+> `modelopt_state`. Restored PTQ/QAT checkpoints therefore had only the custom residual-add
+> quantizers. The script now uses ModelOpt's registered `quantize` mode before the custom
+> entropy/percentile calibration path, and export verification reports Conv nodes that have
+> Q/DQ on both activation and weight inputs. Regenerate PTQ/QAT checkpoints before trusting
+> any ModelOpt INT8 speed or accuracy result.
 
 Procedure adapted from [NVIDIA-AI-IOT/yolo_deepstream/yolov7_qat](https://github.com/NVIDIA-AI-IOT/yolo_deepstream/tree/main/yolov7_qat):
 
@@ -55,6 +61,94 @@ The active baseline uses the full COCO `train2017` image pool so the QAT dataloa
 Why 260 and 20,000: the NVIDIA yolov7_qat/cuDLA QAT scripts use batch 10, `num_batch=25` in a loop that processes batches 0..25, and 10 fine-tune epochs of 200 iterations. That means 260 calibration images and 20,000 train image presentations, not 118,287 train presentations.
 
 ---
+
+## Fresh Fixed-Export Speed Smoke (2026-05-27)
+
+After fixing the manual ModelOpt path to save a non-empty `modelopt_state`, a short `yolo11s` PTQ/zero-epoch export was regenerated and benchmarked through TensorRT 10.13.3 on the RTX 3060 Laptop GPU at `imgsz=640`, batch 1. This is a speed smoke test, not a final accuracy recipe run: calibration used only 32 images with `max`, and QAT used 0 epochs.
+
+Export verification:
+
+```text
+yolo11s_qat.onnx: QuantizeLinear=199, DequantizeLinear=199, Conv Q/DQ=87/88
+```
+
+Accuracy from the same fresh artifact:
+
+| Model/artifact | mAP50 | mAP50-95 | Drop vs PyTorch FP32 | Drop vs ONNX FP32 |
+|---|---:|---:|---:|---:|
+| PyTorch FP32 `yolo11s.pt` | 0.6374 | 0.4622 | baseline | - |
+| ONNX FP32 | 0.6336 | 0.4592 | -0.0030 | baseline |
+| Fixed ModelOpt INT8 ONNX | 0.6263 | 0.4519 | -0.0103 | -0.0073 |
+
+TensorRT latency/throughput:
+
+| Engine | Mean latency | Throughput | vs FP16 |
+|---|---:|---:|---:|
+| FP16 baseline | 2.1686 ms | 460.8 FPS | 1.00x |
+| Fixed ModelOpt INT8 | 1.8039 ms | 553.8 FPS | 1.20x |
+
+Command:
+
+```bash
+QUANTIZATION_VENV=./quantization_venv ./scripts/measure_speedup.sh yolo11s --iterations 200 --warmup 1000
+```
+
+The old `yolo11s` ModelOpt export had `Conv Q/DQ=0/88` and measured slower than FP16. This fresh fixed export is the first ModelOpt result in this repo that shows a real INT8 FPS gain versus FP16 on this GPU.
+
+## Real QAT FPS + Accuracy Check (2026-05-27)
+
+After the fixed ModelOpt checkpoint/export path, `yolo11s` was rerun with the full `yolo11-distill` QAT recipe: `max` calibration over 1024 images, 10 epochs x 200 batches/epoch x batch 8, detect-head output quantizers disabled, DFL excluded, seed 0.
+
+Training command:
+
+```bash
+./quantization_venv/bin/python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
+  --models yolo11s \
+  --qat-recipe yolo11-distill \
+  --calib-size 1024 \
+  --calib-method max \
+  --qat-epochs 10 \
+  --qat-batches-per-epoch 200 \
+  --batch 8 \
+  --val-batch 8 \
+  --workers 4 \
+  --device 0 \
+  --skip-fp32-eval \
+  --qat-log-every 20 \
+  --qat-eval-every 5 \
+  --seed 0
+```
+
+Export verification:
+
+```text
+yolo11s_qat.onnx: QuantizeLinear=199, DequantizeLinear=199, Conv Q/DQ=87/88
+```
+
+Training-side validation from `runs/modelopt_qat/report.json`:
+
+| Stage | mAP50 | mAP50-95 | Notes |
+|---|---:|---:|---|
+| PTQ fake quant | 0.6220 | 0.4475 | 1024-image max calibration |
+| QAT fake quant | 0.6263 | 0.4493 | 10-epoch distill QAT |
+
+Deployment ONNX accuracy from `scripts/measure_accuracy.sh yolo11s`:
+
+| Model/artifact | mAP50 | mAP50-95 | Drop vs PyTorch FP32 | Drop vs ONNX FP32 |
+|---|---:|---:|---:|---:|
+| PyTorch FP32 `yolo11s.pt` | 0.6374 | 0.4622 | baseline | - |
+| ONNX FP32 | 0.6336 | 0.4592 | -0.0030 | baseline |
+| QAT INT8 ONNX | 0.6242 | 0.4470 | -0.0153 | -0.0122 |
+
+TensorRT latency/throughput from `scripts/measure_speedup.sh yolo11s --iterations 200 --warmup 1000`:
+
+| Engine | Mean latency | Throughput | vs FP16 |
+|---|---:|---:|---:|
+| FP32 | 6.0473 ms | 165.3 FPS | 0.28x |
+| FP16 baseline | 2.1614 ms | 462.3 FPS | 1.00x |
+| QAT INT8 | 1.8337 ms | 544.8 FPS | 1.18x |
+
+This confirms the fixed ModelOpt QAT export gives a real INT8 FPS gain versus FP16 on this RTX 3060 Laptop GPU, but the 10-epoch QAT recipe does not recover the zero-epoch smoke-test ONNX accuracy; it ends at `mAP50-95=0.4470`.
 
 ## Current Run
 
@@ -91,9 +185,9 @@ runs/modelopt_qat/yolo26s/
 
 ## Current Metrics
 
-> ⚠️ See the known-issue banner at the top: the exported ModelOpt ONNX has **0 quantized
-> convolutions**, so the tiny PTQ/QAT deltas below mostly reflect the residual-add quantizers,
-> not network-wide INT8. A near-lossless "INT8" result here is a symptom of the export bug.
+> Historical pre-fix yolo26s metrics: these were produced before the 2026-05-26 ModelOpt
+> checkpoint/export fix. The exported ONNX had **0 quantized convolutions**, so the tiny
+> PTQ/QAT deltas below mostly reflect the residual-add quantizers, not network-wide INT8.
 
 Metrics are from `runs/modelopt_qat/yolo26s/summary.json` for the full-source rerun, except FP32, which was not rerun in the metric command.
 
