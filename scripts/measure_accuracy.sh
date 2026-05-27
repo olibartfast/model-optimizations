@@ -11,6 +11,7 @@
 # Usage:
 #   ./scripts/measure_accuracy.sh yolo11s
 #   ./scripts/measure_accuracy.sh yolo26s [--engine]
+#   ./scripts/measure_accuracy.sh yolo26s --run-name yolo26s_speed
 #
 # Env:
 #   PY=<python>             force a Python executable
@@ -23,7 +24,7 @@
 # matching what the QAT pipeline produces.
 #
 # With --engine: also validates the pre-built TRT engines if they exist in
-# runs/modelopt_qat/<stem>/ (run measure_speedup.sh --keep-engines first).
+# runs/modelopt_qat/<run-name>/ (run measure_speedup.sh --keep-engines first).
 # Uses Ultralytics' built-in YOLO(engine_path) loader.
 
 set -e
@@ -35,14 +36,16 @@ cd "$PROJECT_ROOT"
 STEM="${1:-}"
 INCLUDE_ENGINE=0
 AO=0
+RUN_NAME="$STEM"
 if [ -z "$STEM" ] || [[ "$STEM" == -* ]]; then
-    echo "Usage: $0 <model_stem> [--ao] [--engine]" >&2
+    echo "Usage: $0 <model_stem> [--ao] [--run-name NAME] [--engine]" >&2
     exit 2
 fi
 shift
 while [ $# -gt 0 ]; do
     case "$1" in
         --ao) AO=1; shift ;;
+        --run-name) RUN_NAME="$2"; shift 2 ;;
         --engine) INCLUDE_ENGINE=1; shift ;;
         *) echo "Unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -50,14 +53,17 @@ done
 
 # Default backend is NVIDIA ModelOpt; --ao switches to the PyTorch AO export.
 if [ "$AO" -eq 1 ]; then
-    OUT_DIR="runs/pytorch_ao_qat/$STEM"
+    OUT_DIR="runs/pytorch_ao_qat/$RUN_NAME"
     QAT_ONNX="$OUT_DIR/${STEM}_ao_qat.onnx"
 else
-    OUT_DIR="runs/modelopt_qat/$STEM"
+    OUT_DIR="runs/modelopt_qat/$RUN_NAME"
     QAT_ONNX="$OUT_DIR/${STEM}_qat.onnx"
 fi
 # FP32 baseline is backend-independent — reuse the ModelOpt FP32 ONNX if present.
 FP32_ONNX="$OUT_DIR/${STEM}_fp32.onnx"
+if [ ! -f "$FP32_ONNX" ] && [ -f "runs/modelopt_qat/$RUN_NAME/${STEM}_fp32.onnx" ]; then
+    FP32_ONNX="runs/modelopt_qat/$RUN_NAME/${STEM}_fp32.onnx"
+fi
 if [ ! -f "$FP32_ONNX" ] && [ -f "runs/modelopt_qat/$STEM/${STEM}_fp32.onnx" ]; then
     FP32_ONNX="runs/modelopt_qat/$STEM/${STEM}_fp32.onnx"
 fi
@@ -72,7 +78,7 @@ fi
 
 if [ ! -f "$FP32_ONNX" ] || [ ! -f "$QAT_ONNX" ]; then
     echo "ERROR: expected $FP32_ONNX and $QAT_ONNX" >&2
-    echo "       Run ./scripts/measure_speedup.sh $STEM first to produce both ONNX files." >&2
+    echo "       Run ./scripts/measure_speedup.sh $STEM --run-name $RUN_NAME first to produce both ONNX files." >&2
     exit 2
 fi
 

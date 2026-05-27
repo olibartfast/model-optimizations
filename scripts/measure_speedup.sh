@@ -13,6 +13,7 @@
 # Usage:
 #   ./scripts/measure_speedup.sh yolo11s
 #   ./scripts/measure_speedup.sh yolo26s --iterations 500 --warmup 2000
+#   ./scripts/measure_speedup.sh yolo26s --run-name yolo26s_speed
 #
 # Env / flags:
 #   TRTEXEC=<path>          force a specific trtexec binary
@@ -22,6 +23,7 @@
 #   IMGSZ=640 BATCH=1       (defaults)
 #   --iterations N          trtexec --iterations
 #   --warmup N              trtexec --warmUp (ms)
+#   --run-name NAME         read/write runs/modelopt_qat/NAME instead of <model_stem>
 #   --keep-engines          don't delete the .plan files after measurement
 
 set -e
@@ -32,7 +34,7 @@ cd "$PROJECT_ROOT"
 
 STEM="${1:-}"
 if [ -z "$STEM" ] || [[ "$STEM" == -* ]]; then
-    echo "Usage: $0 <model_stem> [--ao] [--iterations N] [--warmup N] [--keep-engines]" >&2
+    echo "Usage: $0 <model_stem> [--ao] [--run-name NAME] [--iterations N] [--warmup N] [--keep-engines]" >&2
     exit 2
 fi
 shift
@@ -51,9 +53,11 @@ ITERATIONS=200
 WARMUP=1000
 KEEP_ENGINES=0
 AO=0
+RUN_NAME="$STEM"
 while [ $# -gt 0 ]; do
     case "$1" in
         --ao) AO=1; shift ;;
+        --run-name) RUN_NAME="$2"; shift 2 ;;
         --iterations) ITERATIONS="$2"; shift 2 ;;
         --warmup) WARMUP="$2"; shift 2 ;;
         --keep-engines) KEEP_ENGINES=1; shift ;;
@@ -100,16 +104,19 @@ echo "ld path: $LD_LIBRARY_PATH"
 # ---- Resolve ONNX paths ---------------------------------------------------
 # Default backend is NVIDIA ModelOpt; --ao switches to the PyTorch AO export.
 if [ "$AO" -eq 1 ]; then
-    OUT_DIR="runs/pytorch_ao_qat/$STEM"
+    OUT_DIR="runs/pytorch_ao_qat/$RUN_NAME"
     QAT_ONNX="$OUT_DIR/${STEM}_ao_qat.onnx"
     echo "backend: PyTorch AO"
 else
-    OUT_DIR="runs/modelopt_qat/$STEM"
+    OUT_DIR="runs/modelopt_qat/$RUN_NAME"
     QAT_ONNX="$OUT_DIR/${STEM}_qat.onnx"
     echo "backend: NVIDIA ModelOpt"
 fi
 # FP32 baseline is backend-independent — reuse the ModelOpt FP32 ONNX if present.
 FP32_ONNX="$OUT_DIR/${STEM}_fp32.onnx"
+if [ ! -f "$FP32_ONNX" ] && [ -f "runs/modelopt_qat/$RUN_NAME/${STEM}_fp32.onnx" ]; then
+    FP32_ONNX="runs/modelopt_qat/$RUN_NAME/${STEM}_fp32.onnx"
+fi
 if [ ! -f "$FP32_ONNX" ] && [ -f "runs/modelopt_qat/$STEM/${STEM}_fp32.onnx" ]; then
     FP32_ONNX="runs/modelopt_qat/$STEM/${STEM}_fp32.onnx"
 fi

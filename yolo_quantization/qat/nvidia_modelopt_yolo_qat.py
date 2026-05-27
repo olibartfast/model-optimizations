@@ -77,7 +77,9 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 # argparse defaults. Only keys the user did not explicitly pass on the CLI
 # are overwritten (see :func:`_apply_recipe`). The `auto` recipe picks one
 # per model family: E2E YOLO26 stays on the distillation recipe that earned
-# the recorded yolo26s baseline; single-head models (YOLOv8/v11/v12) switch
+# the recorded yolo26s baseline; a separate yolo26-speed recipe trades some
+# quantization coverage for lower TensorRT reformat/QDQ overhead; single-head
+# models (YOLOv8/v11/v12) switch
 # to a variant that *keeps the DFL head and Detect output quantizers in
 # floating-point* during INT8 quantization (those layers are particularly
 # noise-sensitive on single-head architectures).
@@ -103,6 +105,33 @@ QAT_RECIPES: dict[str, dict] = {
         "calib_size": 260,
         "disable_detect_output_quant": False,
         "exclude_dfl_quant": False,
+        "no_residual_add_quant": False,
+        "no_share_residual_add_scales": False,
+    },
+    "yolo26-speed": {
+        # Deployment-oriented YOLO26 variant. The fully quantized yolo26s
+        # baseline is near-lossless but slower than FP16 at batch 1 on the
+        # recorded RTX 3060 Laptop GPU because TensorRT spends too much time
+        # scheduling/reformatting explicit residual-add and head Q/DQ islands.
+        #
+        # This recipe follows the ModelOpt PTQ workflow from NVIDIA's May 2026
+        # blog: calibrate representative data, evaluate, iterate on quantized
+        # layer coverage, then export for TensorRT where speedups actually
+        # materialize. It keeps the backbone/neck Conv weights and activations
+        # quantized, but leaves residual adds, DFL, and Detect outputs in
+        # floating point to prioritize INT8-vs-FP16 FPS.
+        "qat_epochs": 0,
+        "qat_batches_per_epoch": 200,
+        "qat_lr": 1e-5,
+        "qat_low_lr": 1e-6,
+        "qat_distill_weight": 1.0,
+        "qat_supervised_weight": 1.0,
+        "calib_method": "max",
+        "calib_size": 1024,
+        "disable_detect_output_quant": True,
+        "exclude_dfl_quant": True,
+        "no_residual_add_quant": True,
+        "no_share_residual_add_scales": True,
     },
     "yolo11-supervised": {
         # Supervised-only fine-tune, max calibration, DFL + Detect-output
@@ -126,6 +155,8 @@ QAT_RECIPES: dict[str, dict] = {
         "calib_size": 1024,
         "disable_detect_output_quant": True,
         "exclude_dfl_quant": True,
+        "no_residual_add_quant": False,
+        "no_share_residual_add_scales": False,
     },
     "yolo11-distill": {
         # Hybrid: keep yolo26-distill's loss schedule (both teacher MSE and
@@ -146,6 +177,8 @@ QAT_RECIPES: dict[str, dict] = {
         "calib_size": 1024,
         "disable_detect_output_quant": True,
         "exclude_dfl_quant": True,
+        "no_residual_add_quant": False,
+        "no_share_residual_add_scales": False,
     },
 }
 
@@ -198,6 +231,8 @@ def _apply_recipe(args, explicit_flags: set[str]) -> str:
         "calib_size": "--calib-size",
         "disable_detect_output_quant": "--disable-detect-output-quant",
         "exclude_dfl_quant": "--exclude-dfl-quant",
+        "no_residual_add_quant": "--no-residual-add-quant",
+        "no_share_residual_add_scales": "--no-share-residual-add-scales",
     }
     applied: list[str] = []
     for key, value in overrides.items():
@@ -1607,13 +1642,15 @@ def run_qat_for_model(
     seed: int | None = None,
     recipe: str | None = None,
     from_ptq: Path | None = None,
+    output_name: str | None = None,
 ) -> ModelResult:
     from ultralytics import YOLO
 
     mto, mtq = _import_modelopt_qat_modules()
 
     print(f"\n=== {model_name} ===")
-    model_dir = OUT_ROOT / model_name
+    run_name = output_name or model_name
+    model_dir = OUT_ROOT / run_name
     model_dir.mkdir(parents=True, exist_ok=True)
     stages: list[StageResult] = []
     sensitivity_results: list[dict] | None = None
@@ -1853,6 +1890,8 @@ def run_qat_for_model(
 
     config_snapshot = {
         "seed": seed,
+        "model_name": model_name,
+        "output_name": run_name,
         "data": str(data_yaml),
         "calib_source": str(calib_dir),
         "calib_size": calib_size,
@@ -1870,6 +1909,8 @@ def run_qat_for_model(
         "batch": batch,
         "val_batch": val_batch,
         "disable_detect_output_quant": disable_detect_output_quant,
+        "patch_residual_adds": patch_residual_adds,
+        "share_residual_add_scales": share_residual_add_scales,
         "keep_fp32_modules": keep_fp32_modules or [],
         "exclude_dfl_quant": exclude_dfl_quant,
         "recipe": recipe,
@@ -2110,6 +2151,15 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS))
+    p.add_argument(
+        "--output-name",
+        default=None,
+        help=(
+            "Optional run directory name under runs/modelopt_qat/. Requires one model. "
+            "Useful for recipe variants such as yolo26s_speed without overwriting "
+            "the baseline yolo26s artifacts."
+        ),
+    )
     p.add_argument("--data", type=Path, default=DEFAULT_DATA_YAML, help="Ultralytics dataset YAML for validation and QAT training")
     p.add_argument("--qat-epochs", type=int, default=10, help="QAT fine-tune epochs")
     p.add_argument("--qat-lr", type=float, default=1e-5, help="Constant LR for QAT fine-tune")
@@ -2180,7 +2230,7 @@ def parse_qat_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="auto",
         help=(
             "Named QAT hyperparameter recipe. 'auto' picks 'yolo26-distill' for E2E "
-            "models (yolo26*) and 'yolo11-supervised' for single-head models "
+            "models (yolo26*) and 'yolo11-distill' for single-head models "
             "(YOLOv8/v11/etc.). Recipe values fill in only flags the user didn't pass; "
             "explicit CLI flags always override."
         ),
@@ -2307,6 +2357,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.from_ptq is not None and len(args.models) != 1:
         print("ERROR: --from-ptq requires exactly one --models entry", file=sys.stderr)
         return 2
+    if args.output_name is not None and len(args.models) != 1:
+        print("ERROR: --output-name requires exactly one --models entry", file=sys.stderr)
+        return 2
+    if args.output_name is not None and (Path(args.output_name).name != args.output_name or args.output_name in {"", ".", ".."}):
+        print("ERROR: --output-name must be a simple directory name, not a path", file=sys.stderr)
+        return 2
 
     all_results: list[ModelResult] = []
     for model_name in args.models:
@@ -2351,6 +2407,7 @@ def main(argv: list[str] | None = None) -> int:
                     seed=args.seed,
                     recipe=resolved_recipe,
                     from_ptq=args.from_ptq,
+                    output_name=args.output_name,
                 )
             )
         except Exception as e:
