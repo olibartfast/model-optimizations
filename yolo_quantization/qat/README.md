@@ -2,7 +2,7 @@
 
 > ## Historical issue — stale ModelOpt exports did not quantize convolutions (found 2026-05-21, fixed 2026-05-26)
 >
-> The exported `runs/modelopt_qat/<stem>/<stem>_qat.onnx` graphs are **not valid INT8 models**:
+> Stale pre-fix `runs/modelopt_qat/<stem>/<stem>_qat.onnx` graphs were **not valid INT8 models**:
 >
 > | Export | Conv layers | Q/DQ pairs | Convs with Q/DQ on act+weight |
 > |---|---:|---:|---:|
@@ -11,8 +11,8 @@
 > | `yolo11s_ao_qat.onnx` (AO) | 88 | 186 | 63 ✅ |
 > | `yolo26s_ao_qat.onnx` (AO) | 102 | 151 | 78 ✅ |
 >
-> Only the ~22–26 patched residual-add quantizers reach the ONNX; **every conv `input_quantizer`
-> / `weight_quantizer` from `mtq` is dropped at export.** A `trtexec --dumpLayerInfo` build
+> Only the ~22-26 patched residual-add quantizers reached those ONNX files; **every conv `input_quantizer`
+> / `weight_quantizer` from `mtq` was dropped at export.** A `trtexec --dumpLayerInfo` build
 > confirms the engine runs FP16 conv tactics throughout (`f16f16…`, no `i8i8`/`imma`) plus 76
 > Reformat layers — so the ModelOpt "INT8 QAT" engine is FP16 + reformat overhead, and measures
 > *slower* than a plain FP16 engine (yolo11s 2.48 ms vs FP16 2.15 ms).

@@ -48,37 +48,18 @@ The full YOLO QAT experiment log, resume commands, and design notes live in:
 
 ## YOLO results at a glance
 
-> ⚠️ **Known issue (2026-05-21): the ModelOpt INT8 numbers below are not valid INT8 results.**
-> Inspection of the exported `runs/modelopt_qat/*/[stem]_qat.onnx` graphs shows **0 of 88 / 102
-> Conv layers wrapped in Q/DQ** — only the ~22–26 patched residual-add tensors are quantized.
-> The resulting TensorRT engine runs **100 % FP16 conv tactics** (verified with `trtexec`
-> `--dumpLayerInfo`: every conv tactic is `f16f16…`, no `i8i8`/`imma`), so the ModelOpt
-> "INT8 QAT" row is really FP16 plus reformatting overhead from the stray Q/DQ — which is why
-> it is *slower* than a plain FP16 engine. The PyTorch AO export is genuine INT8
-> (63/88 and 78/102 convs quantized). See [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md)
-> for the fix plan; the ModelOpt rows are kept below only so the regression is documented.
+ModelOpt QAT exports now include real Conv Q/DQ coverage. The stale pre-2026-05-26 ModelOpt artifacts did not quantize convolutions and should be regenerated before use; the historical details are kept in [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
 
-INT8 QAT was evaluated on COCO `val2017` with `conf=0.001`, `iou=0.6`, and `imgsz=640` on an RTX 3060 Laptop GPU. TensorRT latency was measured at batch 1. **The decisive comparison is vs FP16** — the realistic deployment baseline — not vs FP32, which nobody deploys.
+The freshest end-to-end fixed-export result is `yolo11s` on COCO `val2017` with `conf=0.001`, `iou=0.6`, and `imgsz=640` on an RTX 3060 Laptop GPU. TensorRT latency was measured at batch 1 with TensorRT 10.13.3.
 
-| Model       | Pipeline               | mAP50-95 | Δ vs FP32 | TRT latency | vs FP32 |  vs FP16 |
-| ----------- | ---------------------- | -------: | --------: | ----------: | ------: | -------: |
-| **yolo26s** | FP32 baseline          |   0.4718 |         — |     6.24 ms |   1.00× |        — |
-|             | **FP16 baseline**      |   ≈0.4718 |         — | **2.23 ms** |   2.79× |    1.00× |
-|             | ModelOpt INT8 QAT ⚠️   |   0.4701 |     −0.4% |     2.60 ms |   2.40× | **0.86×** |
-|             | PyTorch AO INT8 QAT    |   0.4661 |     −1.2% |     2.23 ms |   2.80× | **1.00×** |
-| **yolo11s** | FP32 baseline          |   0.4622 |         — |     6.04 ms |   1.00× |        — |
-|             | **FP16 baseline**      |   ≈0.4622 |         — | **2.15 ms** |   2.81× |    1.00× |
-|             | ModelOpt INT8 QAT ⚠️   |   0.4602 |     −0.4% |     2.48 ms |   2.44× | **0.87×** |
-|             | PyTorch AO INT8 QAT    |   0.4560 |     −1.3% |     2.23 ms |   2.68× | **0.96×** |
+| Model       | Pipeline                | Conv Q/DQ | mAP50-95 | Delta vs PyTorch FP32 | TRT latency | vs FP16 |
+| ----------- | ----------------------- | --------: | -------: | --------------------: | ----------: | ------: |
+| **yolo11s** | PyTorch FP32 baseline   |         - |   0.4622 |              baseline |     6.05 ms |   0.28x |
+|             | FP16 baseline           |         - |   ~0.4592 ONNX |           -0.0030 | 2.16 ms |   1.00x |
+|             | ModelOpt INT8 QAT       |     87/88 |   0.4470 |               -0.0153 |     1.83 ms |   1.18x |
+|             | ModelOpt INT8 PTQ smoke |     87/88 |   0.4519 |               -0.0103 |     1.80 ms |   1.20x |
 
-**Current recommendation for YOLO:** on the tested RTX 3060 Laptop GPU, **deploy FP16**. It is
-2.8× faster than FP32, lossless, and — as the `vs FP16` column shows — no INT8 engine beats it:
-the (genuine) PyTorch AO INT8 only *matches* FP16, and the ModelOpt "INT8" engine is 13–16 %
-*slower* because it is FP16 plus reformat overhead, not INT8 at all. At batch 1 with these small
-detectors, FP16 tensor cores are already saturated and INT8 has no latency headroom to win.
-INT8 may still pay off on INT8-favorable hardware (datacenter GPUs, DLA, Jetson) or at larger
-batch / model size — but that is **untested here**, and the ModelOpt export bug must be fixed
-before any ModelOpt INT8 claim can be trusted.
+Current interpretation: the fixed ModelOpt export gives a real INT8 throughput gain over FP16 on this GPU, but the current `yolo11-distill` QAT recipe loses about 0.012 mAP50-95 versus the ONNX FP32 baseline. `yolo26s` full fixed-export metrics still need to be regenerated; old yolo26s ModelOpt speed/accuracy rows are no longer shown as current results.
 
 ## Quick start
 
@@ -105,14 +86,8 @@ Run the full YOLO26-small QAT pipeline:
 
 ```bash
 python yolo_quantization/qat/nvidia_modelopt_yolo_qat.py \
-  --models yolo26s \
-  --qat-epochs 10 \
-  --qat-batches-per-epoch 200 \
-  --calib-size 260 \
-  --imgsz 640 \
-  --batch 10 \
-  --val-batch 8 \
-  --device 0
+  --models yolo26s --qat-recipe auto \
+  --qat-log-every 20 --qat-eval-every 5 --seed 0
 ```
 
 Run PTQ-only ONNX export:
@@ -160,70 +135,35 @@ In the tested YOLO11 setup, these exclusions are required because PTQ is already
 
 ## Accuracy by stage: PTQ vs QAT
 
-All numbers were validated on COCO `val2017` with `conf=0.001`, `iou=0.6`, and `imgsz=640` on an RTX 3060 Laptop GPU. Δ shows absolute mAP50-95 loss and relative percentage loss versus FP32.
+Current fixed-export ModelOpt metrics are tracked in [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md). The most recent complete fixed-export run is `yolo11s` with `yolo11-distill`:
 
-| Model       | Backend    | Recipe              | Stage                    |      mAP50 |   mAP50-95 | Δ mAP50-95 vs FP32 |
-| ----------- | ---------- | ------------------- | ------------------------ | ---------: | ---------: | -----------------: |
-| **yolo26s** | ModelOpt   | `yolo26-distill`    | FP32                     |     0.6384 |     0.4718 |           baseline |
-|             | ModelOpt   |                     | PTQ INT8                 |     0.6368 |     0.4706 |     −0.0012 ≈0.25% |
-|             | ModelOpt   |                     | **QAT INT8**             | **0.6370** | **0.4701** | **−0.0017 ≈0.36%** |
-|             | PyTorch AO | `yolo26-ao-distill` | PTQ INT8                 |     0.6321 |     0.4666 |      −0.0053 ≈1.1% |
-|             | PyTorch AO |                     | **QAT INT8**             | **0.6326** | **0.4661** |  **−0.0058 ≈1.2%** |
-| **yolo11s** | ModelOpt   | `yolo11-distill`    | FP32                     |     0.6376 |     0.4622 |           baseline |
-|             | ModelOpt   |                     | PTQ INT8                 |     0.6370 |     0.4614 |     −0.0008 ≈0.17% |
-|             | ModelOpt   |                     | **QAT INT8** best @ ep 2 | **0.6358** | **0.4602** | **−0.0020 ≈0.43%** |
-|             | PyTorch AO | `yolo11-ao-distill` | PTQ INT8                 |     0.6321 |     0.4582 |     −0.0040 ≈0.87% |
-|             | PyTorch AO |                     | **QAT INT8**             | **0.6337** | **0.4560** |  **−0.0062 ≈1.3%** |
+| Stage | mAP50 | mAP50-95 | Notes |
+| ----- | ----: | -------: | ----- |
+| PyTorch FP32 | 0.6374 | 0.4622 | Baseline checkpoint validation. |
+| ONNX FP32 | 0.6336 | 0.4592 | Export baseline used for ONNX delta. |
+| PTQ fake quant | 0.6220 | 0.4475 | 1024-image `max` calibration. |
+| QAT fake quant | 0.6263 | 0.4493 | 10 epochs x 200 batches, batch 8. |
+| QAT INT8 ONNX | 0.6242 | 0.4470 | `Conv Q/DQ=87/88`. |
 
-Both AO recipes keep the Detect head in FP32 and calibrate with histogram observers (see [PyTorch AO quantization details](#pytorch-ao-quantization-details)); this brought AO PTQ to within 0.003–0.005 mAP50-95 of ModelOpt PTQ. Once PTQ is that strong the QAT step no longer helps — for AO (as for ModelOpt single-head models) QAT lands at or just below PTQ, so the deployable model is whichever stage scored higher.
+Pre-fix ModelOpt tables that reported near-lossless QAT with slower-than-FP16 TensorRT are intentionally omitted here because those ONNX exports had no quantized convolutions. Regenerate old checkpoints before using their numbers.
+
+PyTorch AO remains a useful comparison path. Its exported ONNX graphs have real Q/DQ coverage, but on the tested RTX 3060 Laptop GPU the AO INT8 engines matched or trailed FP16 batch-1 latency while losing about 1% mAP50-95.
 
 ## TensorRT speedup
 
-Measured at batch 1 and `imgsz=640` on an RTX 3060 Laptop GPU.
+Measured at batch 1 and `imgsz=640` on an RTX 3060 Laptop GPU with `scripts/measure_speedup.sh yolo11s --iterations 200 --warmup 1000`:
 
-The benchmark uses `scripts/measure_speedup.sh <stem>`, with `--ao` for the PyTorch AO export. `trtexec` 10.13.3 was used. The FP32 engine is measured with `--noTF32` for a strict-FP32 baseline; the FP16 engine is built from the same FP32 ONNX with `--fp16`. **FP16 is the realistic deployment baseline — INT8 has to beat the `vs FP16` column to be worth the accuracy cost.**
+| Engine | Mean latency | Throughput | vs FP16 |
+| ------ | -----------: | ---------: | ------: |
+| FP32 | 6.0473 ms | 165.3 FPS | 0.28x |
+| FP16 baseline | 2.1614 ms | 462.3 FPS | 1.00x |
+| Fixed ModelOpt QAT INT8 | 1.8337 ms | 544.8 FPS | 1.18x |
 
-| Model       | Backend    | Engine   | Mean latency | Throughput | vs FP32 | vs FP16 |
-| ----------- | ---------- | -------- | -----------: | ---------: | ------: | ------: |
-| **yolo26s** | —          | FP32     |      6.24 ms |  160.3 qps |   1.00× |       — |
-|             | —          | **FP16** |  **2.23 ms** |  447.8 qps |   2.79× |   1.00× |
-|             | ModelOpt   | INT8 QAT ⚠️ |  2.60 ms |  385.0 qps |   2.40× | **0.86×** |
-|             | PyTorch AO | INT8 QAT |      2.23 ms |  448.5 qps |   2.80× | **1.00×** |
-| **yolo11s** | —          | FP32     |      6.04 ms |  165.5 qps |   1.00× |       — |
-|             | —          | **FP16** |  **2.15 ms** |  465.2 qps |   2.81× |   1.00× |
-|             | ModelOpt   | INT8 QAT ⚠️ |  2.48 ms |  403.5 qps |   2.44× | **0.87×** |
-|             | PyTorch AO | INT8 QAT |      2.23 ms |  448.4 qps |   2.68× | **0.96×** |
-
-What this shows:
-
-* **Against FP16, no INT8 engine wins.** The genuine PyTorch AO INT8 engine only matches FP16 (1.00×/0.96×); the ModelOpt "INT8" engine is 13–16 % *slower*. The "2.4×" headline was always INT8-vs-FP32 — a baseline nobody deploys.
-* The ModelOpt ⚠️ rows are **not real INT8** (see the known-issue note at the top of this README): the engine runs FP16 conv tactics throughout, and the only thing the stray residual-add Q/DQ nodes add is 76 Reformat layers of overhead — hence *slower* than the clean FP16 engine.
-* At batch 1 with these small detectors, Ampere FP16 tensor cores are already saturated, so INT8 has no latency headroom on this GPU even when the export is correct.
+A zero-epoch `yolo11s` PTQ smoke export with 32-image `max` calibration measured 1.8039 ms / 553.8 FPS and `Conv Q/DQ=87/88`. That smoke result proves the fixed export path can produce real INT8 speedup; the full recipe still needs accuracy tuning.
 
 ## Export accuracy: ONNX vs FP32 baseline
 
-Q/DQ node counts verify graph topology, but not numerical fidelity. Exported ONNX models are validated against the PyTorch checkpoint baseline through Ultralytics' ONNX Runtime backend using `scripts/measure_accuracy.sh <stem>`, with `--ao` for the AO export.
-
-| Model       | Backend    | Format                 |  mAP50 | mAP50-95 | Δ mAP50-95 vs FP32 ONNX |
-| ----------- | ---------- | ---------------------- | -----: | -------: | ----------------------: |
-| **yolo26s** | ModelOpt   | ONNX FP32 ORT baseline | 0.6362 |   0.4717 |                baseline |
-|             | ModelOpt   | ONNX INT8 QAT          | 0.6354 |   0.4700 |           −0.0017 ≈0.4% |
-|             | PyTorch AO | ONNX INT8 QAT          | 0.6304 |   0.4659 |           −0.0058 ≈1.2% |
-| **yolo11s** | ModelOpt   | ONNX FP32 ORT baseline | 0.6336 |   0.4592 |                baseline |
-|             | ModelOpt   | ONNX INT8 QAT          | 0.6325 |   0.4572 |           −0.0020 ≈0.4% |
-|             | PyTorch AO | ONNX INT8 QAT          | 0.6313 |   0.4544 |           −0.0048 ≈1.0% |
-
-The PyTorch-checkpoint vs ONNX-FP32 gap is about 0.003 for `yolo11s` and about 0.0001 for `yolo26s`. This appears to come from ONNX Runtime postprocessing roundoff and is independent of quantization.
-
-The ONNX-FP32 to ONNX-INT8 delta is the main export-fidelity check. PyTorch AO INT8 matches its own QAT checkpoint closely, so the AO loss comes from the quantization recipe rather than an export bug.
-
-> ⚠️ The "ModelOpt ONNX INT8 QAT" row above stays within noise of its FP32 baseline **because
-> the graph is not actually quantized** — 0 of its conv layers carry Q/DQ (see the known-issue
-> note at the top of this README). A near-zero delta here is the *symptom*, not a pass: a
-> correct INT8 export would show a measurable (small) accuracy drop. Q/DQ node *count* alone
-> never proved INT8 — the export check must verify Q/DQ actually wrap conv act+weight inputs.
-
-> **Note:** TensorRT engines are benchmarked for speed, but not validated for accuracy through Ultralytics in this setup. The installed `tensorrt` Python package version 10.16 and the `trtexec` version 10.13 used to build the engine disagree on the serialized engine format. The ONNX Runtime Q/DQ validation above is used as the backend-independent accuracy stand-in.
+Q/DQ node counts verify graph topology, but not numerical fidelity. Exported ONNX models are validated against the PyTorch checkpoint baseline through Ultralytics ONNX Runtime backend using `scripts/measure_accuracy.sh <stem>`, with `--ao` for the AO export. For ModelOpt results, also check Conv Q/DQ coverage; Q/DQ node count alone is not enough.
 
 ## PyTorch AO quantization details
 
