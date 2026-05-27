@@ -239,8 +239,9 @@ hurts it.
 - Required smoke checks before any full COCO run: PTQ/restore succeeds, one-batch backward works, mAP is sane on a small validation slice, and ONNX export/deployability is verified. Do not treat activation+weight INT4 as ready or expected to work until those checks pass.
 
 The PyTorch AO fake-quant alternative (`pytorch_ao_yolo_qat.py`) is no longer
-roadmap work — it is benchmarked end-to-end. See the "PyTorch AO QAT" section
-of the top-level [`README.md`](../../README.md) for results and the
+roadmap work — it is benchmarked end-to-end. See
+[PyTorch AO quantization details](../../README.md#pytorch-ao-quantization-details)
+in the top-level [`README.md`](../../README.md) for results and the
 [Commands](#commands) section below for how to run it.
 
 ---

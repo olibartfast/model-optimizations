@@ -48,7 +48,7 @@ The full YOLO QAT experiment log, resume commands, and design notes live in:
 
 ## YOLO results at a glance
 
-ModelOpt QAT exports now include real Conv Q/DQ coverage. The stale pre-2026-05-26 ModelOpt artifacts did not quantize convolutions and should be regenerated before use; the historical details are kept in [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
+ModelOpt QAT exports now include real Conv Q/DQ coverage (`Conv Q/DQ=87/88` on `yolo11s`). Regenerate any checkpoints or ONNX files produced before the 2026-05-26 ModelOpt checkpoint/export fix before trusting INT8 speed or accuracy numbers. Current fixed-export metrics and commands live in [`yolo_quantization/qat/README.md`](yolo_quantization/qat/README.md).
 
 The freshest end-to-end fixed-export result is `yolo11s` on COCO `val2017` with `conf=0.001`, `iou=0.6`, and `imgsz=640` on an RTX 3060 Laptop GPU. TensorRT latency was measured at batch 1 with TensorRT 10.13.3.
 
@@ -131,7 +131,7 @@ The recipe is designed for the tested YOLO11 setup and uses the same distillatio
 * the DFL head, because its 16-bin probability distribution is fragile under INT8 quantization;
 * the Detect head output quantizers, because of their wide dynamic range.
 
-In the tested YOLO11 setup, these exclusions are required because PTQ is already near-lossless. QAT movement on the fully quantized graph regresses below the PTQ baseline.
+In the tested YOLO11 setup, these exclusions raise the PTQ baseline. Without them, single-head QAT on the fully quantized graph regresses below PTQ.
 
 ## Accuracy by stage: PTQ vs QAT
 
@@ -145,9 +145,7 @@ Current fixed-export ModelOpt metrics are tracked in [`yolo_quantization/qat/REA
 | QAT fake quant | 0.6263 | 0.4493 | 10 epochs x 200 batches, batch 8. |
 | QAT INT8 ONNX | 0.6242 | 0.4470 | `Conv Q/DQ=87/88`. |
 
-Pre-fix ModelOpt tables that reported near-lossless QAT with slower-than-FP16 TensorRT are intentionally omitted here because those ONNX exports had no quantized convolutions. Regenerate old checkpoints before using their numbers.
-
-PyTorch AO remains a useful comparison path. Its exported ONNX graphs have real Q/DQ coverage, but on the tested RTX 3060 Laptop GPU the AO INT8 engines matched or trailed FP16 batch-1 latency while losing about 1% mAP50-95.
+Pre-fix ModelOpt tables that reported near-lossless QAT with slower-than-FP16 TensorRT are intentionally omitted here because those ONNX exports had no quantized convolutions.
 
 ## TensorRT speedup
 
@@ -174,12 +172,12 @@ The PyTorch AO path uses symmetric INT8 quantization:
 
 TensorRT rejects asymmetric `QuantizeLinear` nodes with non-zero zero-points on GPU, so the symmetric scheme is required for the exported Q/DQ ONNX graph to build as an INT8 engine.
 
-Two recipe choices close most of the accuracy gap to ModelOpt, both found by PTQ-only ablations on `yolo26s`:
+Two recipe choices materially improve AO accuracy, both found by PTQ-only ablations on `yolo26s`:
 
-* **Detect head kept FP32** (`--keep-detect-head-fp32`, the default for both AO recipes). AO's symmetric-int8 quantizers on the detect-head prediction towers cost ≈0.013 mAP50-95; keeping the whole `Detect` module FP — backbone and neck stay INT8 — recovers it. This is the dominant fix: it took `yolo26s` PTQ from 0.4523 to 0.4655.
+* **Detect head kept FP32** (`--keep-detect-head-fp32`, the default for both AO recipes). AO's symmetric-int8 quantizers on the detect-head prediction towers cost ≈0.013 mAP50-95; keeping the whole `Detect` module FP — backbone and neck stay INT8 — recovers it. This is the dominant fix: it took `yolo26s` AO PTQ from 0.4523 to 0.4655.
 * **Histogram activation observers** for both recipes. `HistogramObserver` clips activation outliers far better than `MovingAverageMinMaxObserver` (+0.0075 mAP50-95 at PTQ for `yolo11s`; histogram already won for `yolo26s`).
 
-With both, AO PTQ lands within 0.003–0.005 mAP50-95 of ModelOpt PTQ. The cost is speed: the FP Detect head drops the TensorRT speedup from ≈3.0× to ≈2.7×.
+AO exports carry real Conv Q/DQ coverage, but on the tested RTX 3060 Laptop GPU the AO INT8 engines matched or trailed FP16 batch-1 latency while losing about 1% mAP50-95. Keeping the Detect head in FP32 also caps AO TensorRT speedup below the fixed ModelOpt INT8 path. Use AO mainly as a non-ModelOpt recipe comparison, not as the deployable default here.
 
 Checkpoints and ONNX exports are saved under:
 
