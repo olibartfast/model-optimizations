@@ -19,7 +19,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install quality tools
-        run: python -m pip install --upgrade pip ruff
+        # Pinned: ruff expands its default rule set across minor versions,
+        # so an unpinned install turns CI red without any code change.
+        run: python -m pip install --upgrade pip "ruff==0.15.12"
 
       - name: Ruff lint
         run: |
